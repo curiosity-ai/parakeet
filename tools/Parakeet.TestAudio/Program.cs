@@ -72,27 +72,30 @@ void Samples(int perRegion)
 
 async Task Synth(string model, int threads, int seed)
 {
-    (string Id, string Speaker, string Text)[] sentences =
+    // Written: the expected transcript where it differs from the spoken text (the model writes numbers as digits).
+    (string Id, string Speaker, string Text, string? Written)[] sentences =
     [
-        ("synth-weather", "ryan", "Good morning! The weather today is sunny with a light breeze, perfect for a walk in the park."),
-        ("synth-numbers", "serena", "The meeting was moved to three thirty on Tuesday, and we expect about two hundred and fifty people to attend."),
-        ("synth-science", "aiden", "Photosynthesis converts light energy into chemical energy, which plants store as sugar in their leaves."),
-        ("synth-story", "vivian", "Once upon a time, a little fox lived at the edge of a quiet forest, and every evening she watched the stars appear one by one."),
-        ("synth-tech", "eric", "To install the package, open a terminal, change into the project directory, and run the build command."),
+        ("synth-weather", "ryan", "Good morning! The weather today is sunny with a light breeze, perfect for a walk in the park.", null),
+        ("synth-numbers", "serena", "The meeting was moved to three thirty on Tuesday, and we expect about two hundred and fifty people to attend.",
+            "The meeting was moved to 3:30 on Tuesday, and we expect about 250 people to attend."),
+        ("synth-science", "aiden", "Photosynthesis converts light energy into chemical energy, which plants store as sugar in their leaves.", null),
+        ("synth-story", "vivian", "Once upon a time, a little fox lived at the edge of a quiet forest, and every evening she watched the stars appear one by one.", null),
+        ("synth-tech", "eric", "To install the package, open a terminal, change into the project directory, and run the build command.", null),
         ("synth-long", "ryan",
             "Speech recognition has come a long way over the last decade. Early systems needed careful dictation in a quiet room, " +
             "and they still made many mistakes. Modern neural models listen to ordinary conversation, handle different accents, " +
             "and produce punctuated text in a fraction of real time. This progress came from large amounts of training data, " +
-            "better architectures such as the conformer, and decoding methods that predict both tokens and their durations."),
+            "better architectures such as the conformer, and decoding methods that predict both tokens and their durations.", null),
     ];
 
     using var tts = await Qwen3Tts.LoadAsync(model, threads);
     var speakers = new HashSet<string>(tts.Speakers, StringComparer.OrdinalIgnoreCase);
-    foreach (var (id, speaker, text) in sentences)
+    foreach (var (id, speaker, text, written) in sentences)
     {
         string file = id + ".wav";
-        if (manifest.Any(c => c.File == file) && File.Exists(Path.Combine(outDir, file)))
+        if (manifest.FirstOrDefault(c => c.File == file) is { } existing && File.Exists(Path.Combine(outDir, file)))
         {
+            Add(existing with { Text = text, Written = written });
             Console.WriteLine($"{file}: exists, skipped");
             continue;
         }
@@ -100,7 +103,7 @@ async Task Synth(string model, int threads, int seed)
         var result = tts.SynthesizeCustomVoice(text, voice, "english", options: new GenerationOptions { Seed = seed });
         float[] audio = AudioFile.Resample(result.Audio, result.SampleRate, TargetRate);
         AudioFile.WriteWav(Path.Combine(outDir, file), audio, TargetRate);
-        Add(new Clip(file, text, "voxwerk-synth", voice, "", Math.Round(audio.Length / (double)TargetRate, 2)));
+        Add(new Clip(file, text, "voxwerk-synth", voice, "", Math.Round(audio.Length / (double)TargetRate, 2)) { Written = written });
         Console.WriteLine($"{file}: {audio.Length / (double)TargetRate:F1}s (RTF {result.RealTimeFactor:F2})  {text}");
     }
 }
@@ -117,4 +120,8 @@ string? Option(string name)
     return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
 }
 
-internal sealed record Clip(string File, string Text, string Source, string Voice, string Region, double Seconds);
+internal sealed record Clip(string File, string Text, string Source, string Voice, string Region, double Seconds)
+{
+    /// <summary>Expected transcript in written form, when it differs from <see cref="Text"/> (e.g. numbers as digits).</summary>
+    public string? Written { get; init; }
+}

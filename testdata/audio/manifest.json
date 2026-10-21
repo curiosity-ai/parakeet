@@ -5,7 +5,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-africa-abena-mensah",
     "Region": "africa",
-    "Seconds": 11.28
+    "Seconds": 11.28,
+    "Written": null
   },
   {
     "File": "sample-en-africa-babatunde-oyelaran.wav",
@@ -13,7 +14,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-africa-babatunde-oyelaran",
     "Region": "africa",
-    "Seconds": 10.32
+    "Seconds": 10.32,
+    "Written": null
   },
   {
     "File": "sample-en-africa-folake-adeyemi.wav",
@@ -21,7 +23,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-africa-folake-adeyemi",
     "Region": "africa",
-    "Seconds": 10.8
+    "Seconds": 10.8,
+    "Written": null
   },
   {
     "File": "sample-en-gb-mei-lin-ashcombe.wav",
@@ -29,7 +32,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-gb-mei-lin-ashcombe",
     "Region": "gb",
-    "Seconds": 15.2
+    "Seconds": 15.2,
+    "Written": null
   },
   {
     "File": "sample-en-us-aaliyah-renwick.wav",
@@ -37,7 +41,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-aaliyah-renwick",
     "Region": "us",
-    "Seconds": 10.8
+    "Seconds": 10.8,
+    "Written": null
   },
   {
     "File": "sample-en-us-ainsley-garner.wav",
@@ -45,7 +50,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-ainsley-garner",
     "Region": "us",
-    "Seconds": 11.44
+    "Seconds": 11.44,
+    "Written": null
   },
   {
     "File": "sample-en-us-alexis-montoya.wav",
@@ -53,7 +59,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-alexis-montoya",
     "Region": "us",
-    "Seconds": 10.24
+    "Seconds": 10.24,
+    "Written": null
   },
   {
     "File": "sample-en-us-ambrose-delgado.wav",
@@ -61,7 +68,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-ambrose-delgado",
     "Region": "us",
-    "Seconds": 16.88
+    "Seconds": 16.88,
+    "Written": null
   },
   {
     "File": "sample-en-us-ambrose-kettering.wav",
@@ -69,7 +77,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-ambrose-kettering",
     "Region": "us",
-    "Seconds": 14.32
+    "Seconds": 14.32,
+    "Written": null
   },
   {
     "File": "sample-en-us-amos-thackeray.wav",
@@ -77,7 +86,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-amos-thackeray",
     "Region": "us",
-    "Seconds": 13.68
+    "Seconds": 13.68,
+    "Written": null
   },
   {
     "File": "sample-en-us-annabel-greaves.wav",
@@ -85,7 +95,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-annabel-greaves",
     "Region": "us",
-    "Seconds": 11.84
+    "Seconds": 11.84,
+    "Written": null
   },
   {
     "File": "sample-en-us-augustus-pembrook.wav",
@@ -93,7 +104,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-augustus-pembrook",
     "Region": "us",
-    "Seconds": 15.76
+    "Seconds": 15.76,
+    "Written": null
   },
   {
     "File": "sample-en-us-brandon-vossler.wav",
@@ -101,7 +113,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-brandon-vossler",
     "Region": "us",
-    "Seconds": 13.44
+    "Seconds": 13.44,
+    "Written": null
   },
   {
     "File": "sample-en-us-cornelius-batiste.wav",
@@ -109,7 +122,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-cornelius-batiste",
     "Region": "us",
-    "Seconds": 11.44
+    "Seconds": 11.44,
+    "Written": null
   },
   {
     "File": "sample-en-us-desmond-okoro.wav",
@@ -117,7 +131,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-desmond-okoro",
     "Region": "us",
-    "Seconds": 12.48
+    "Seconds": 12.48,
+    "Written": null
   },
   {
     "File": "sample-en-us-dottie-bonbon.wav",
@@ -125,7 +140,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-dottie-bonbon",
     "Region": "us",
-    "Seconds": 10.08
+    "Seconds": 10.08,
+    "Written": null
   },
   {
     "File": "sample-en-us-imani-castellow.wav",
@@ -133,7 +149,8 @@
     "Source": "voxwerk-sample",
     "Voice": "en-us-imani-castellow",
     "Region": "us",
-    "Seconds": 11.04
+    "Seconds": 11.04,
+    "Written": null
   },
   {
     "File": "synth-long.wav",
@@ -141,7 +158,8 @@
     "Source": "voxwerk-synth",
     "Voice": "ryan",
     "Region": "",
-    "Seconds": 36.88
+    "Seconds": 36.88,
+    "Written": null
   },
   {
     "File": "synth-numbers.wav",
@@ -149,7 +167,8 @@
     "Source": "voxwerk-synth",
     "Voice": "serena",
     "Region": "",
-    "Seconds": 8.16
+    "Seconds": 8.16,
+    "Written": "The meeting was moved to 3:30 on Tuesday, and we expect about 250 people to attend."
   },
   {
     "File": "synth-science.wav",
@@ -157,7 +176,8 @@
     "Source": "voxwerk-synth",
     "Voice": "aiden",
     "Region": "",
-    "Seconds": 6.48
+    "Seconds": 6.48,
+    "Written": null
   },
   {
     "File": "synth-story.wav",
@@ -165,7 +185,8 @@
     "Source": "voxwerk-synth",
     "Voice": "vivian",
     "Region": "",
-    "Seconds": 10.56
+    "Seconds": 10.56,
+    "Written": null
   },
   {
     "File": "synth-tech.wav",
@@ -173,7 +194,8 @@
     "Source": "voxwerk-synth",
     "Voice": "eric",
     "Region": "",
-    "Seconds": 6.96
+    "Seconds": 6.96,
+    "Written": null
   },
   {
     "File": "synth-weather.wav",
@@ -181,6 +203,7 @@
     "Source": "voxwerk-synth",
     "Voice": "ryan",
     "Region": "",
-    "Seconds": 6.88
+    "Seconds": 6.88,
+    "Written": null
   }
 ]

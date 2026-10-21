@@ -156,11 +156,18 @@ public sealed unsafe class OnnxModelSource : ITensorSource
         }
     }
 
-    /// <summary>"/layers.0/feed_forward1/linear1/MatMul_output_0" → "layers.0.feed_forward1.linear1".</summary>
+    /// <summary>"/layers.0/feed_forward1/linear1/MatMul_output_0" → "layers.0.feed_forward1.linear1". Scopes of children
+    /// of containers repeat the container name ("/joint/joint_net/joint_net.2/…" → "joint.joint_net.2").</summary>
     private static string ModulePath(string output, string suffix)
     {
         if (!output.StartsWith('/') || !output.EndsWith(suffix, StringComparison.Ordinal)) return "";
-        return output[1..^suffix.Length].Replace('/', '.');
+        var parts = new List<string>();
+        foreach (var scope in output[1..^suffix.Length].Split('/'))
+        {
+            if (parts.Count > 0 && scope.StartsWith(parts[^1] + ".", StringComparison.Ordinal)) parts[^1] = scope;
+            else parts.Add(scope);
+        }
+        return string.Join('.', parts);
     }
 
     private void Add(string name, Init t, bool transpose)
