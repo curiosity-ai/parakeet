@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>Parakeet</PackageId>
+    <Description>Pure C# (.NET 10) inference for NVIDIA Parakeet TDT speech recognition (FastConformer encoder + Token-and-Duration Transducer), loading the official .nemo checkpoint or the ONNX export, with no native dependencies.</Description>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Visible="false" Condition="Exists('..\..\README.md')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.13" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Parakeet.Tests" />
+    <InternalsVisibleTo Include="Parakeet.Cli" />
+  </ItemGroup>
+
+</Project>

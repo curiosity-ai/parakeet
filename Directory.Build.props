@@ -1,0 +1,22 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TieredPGO>true</TieredPGO>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- NuGet metadata shared by every package (the version is stamped by CI: /p:Version=yy.M.<buildId>). -->
+  <PropertyGroup>
+    <Authors>Parakeet contributors</Authors>
+    <PackageProjectUrl>https://github.com/curiosity-ai/parakeet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/curiosity-ai/parakeet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageTags>asr;speech-recognition;speech-to-text;parakeet;nemo;tdt;conformer</PackageTags>
+  </PropertyGroup>
+</Project>

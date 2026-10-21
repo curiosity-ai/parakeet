@@ -1,0 +1,14 @@
+bin/
+obj/
+*.user
+.vs/
+.idea/
+.vscode/
+*.swp
+TestResults/
+packages/
+/models/
+.venv*/
+__pycache__/
+*.partial
+.DS_Store

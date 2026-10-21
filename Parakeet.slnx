@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Parakeet/Parakeet.csproj" />
+    <Project Path="src/Parakeet.Cli/Parakeet.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Parakeet.Tests/Parakeet.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/Parakeet.TestAudio/Parakeet.TestAudio.csproj" />
+  </Folder>
+</Solution>
