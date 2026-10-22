@@ -4,8 +4,11 @@ using Parakeet.Numerics;
 namespace Parakeet.Model;
 
 /// <summary>Reads named tensors from a checkpoint and converts them into the layouts the kernels use.</summary>
-internal sealed unsafe class WeightReader(ITensorSource src)
+internal sealed unsafe class WeightReader(ITensorSource src, bool hugePages = false)
 {
+    /// <summary>Whether packed weights are backed by transparent huge pages.</summary>
+    public bool HugePages => hugePages;
+
     public bool Has(string name) => src.Contains(name);
 
     public Tensor Get(string name, params int[] shape)
@@ -33,7 +36,7 @@ internal sealed unsafe class WeightReader(ITensorSource src)
     {
         var t = Get(name, outDim, inDim);
         PackedMatrix? m = null;
-        t.With(p => m = PackedMatrix.FromLinear((float*)p, outDim, inDim, inDim, scale));
+        t.With(p => m = PackedMatrix.FromLinear((float*)p, outDim, inDim, inDim, scale, hugePages));
         return m!;
     }
 
@@ -49,7 +52,7 @@ internal sealed unsafe class WeightReader(ITensorSource src)
             span.CopyTo(new Span<float>(tmp.Ptr + off, span.Length));
             off += span.Length;
         }
-        return PackedMatrix.FromLinear(tmp.Ptr, n, inDim);
+        return PackedMatrix.FromLinear(tmp.Ptr, n, inDim, hugePages: hugePages);
     }
 
     /// <summary>Concatenates optional biases of fused projections (zeros where absent); null when none exist.</summary>

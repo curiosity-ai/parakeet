@@ -22,14 +22,14 @@ public static unsafe class Gemm
 {
     private const int InitZero = 0, InitLoad = 1, InitBias = 2, InitLoadBias = 3;
     private const int NR = PackedMatrix.NR;
-    private static readonly int KC = PackedMatrix.KBlock;
-    private static readonly int PrefetchDistance = int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_PF"), out int pf) ? pf : 1024;
-    private static readonly int NC = (int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_NCP"), out int ncp) ? ncp : 16) * NR;
+    private const int KC = PackedMatrix.KBlock;
+    private const int PrefetchDistance = 1024;   // floats ahead in the B stream (≈ 32 k-steps)
+    private const int NC = 16 * NR;              // panels per B block
 
     internal static readonly bool UseAvx512 = Avx512F.IsSupported;
     internal static readonly bool UseAvx2 = !UseAvx512 && Avx2.IsSupported && Fma.IsSupported;
     internal static readonly int MR = UseAvx512 ? 12 : UseAvx2 ? 2 : 1;
-    private static readonly int MC = MR * (int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_MCT"), out int mct) ? mct : 40);
+    private static readonly int MC = MR * 40;   // rows per work item
 
     [ThreadStatic] private static Scratch? t_scratch;
     [ThreadStatic] private static NativeBuffer<float>? t_aPack;
@@ -122,7 +122,7 @@ public static unsafe class Gemm
         float* cTile = s.CTile.Ptr, biasTile = s.Bias.Ptr;
         int K = b.K, N = b.N;
         int t0 = m0 / MR, t1 = (m1 + MR - 1) / MR;
-        int panelsPerBlock = NC / NR;
+        const int panelsPerBlock = NC / NR;
         for (int k0 = 0; k0 < K; k0 += KC)
         {
             int kc = Math.Min(KC, K - k0);
@@ -283,11 +283,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             a += 12; b += 32;
@@ -332,11 +329,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -389,11 +383,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -454,11 +445,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -527,11 +515,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -608,11 +593,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -697,11 +679,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -794,11 +773,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -899,11 +875,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -1012,11 +985,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -1133,11 +1103,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -1262,11 +1229,8 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
-            if (PrefetchDistance > 0)
-            {
-                Sse.Prefetch0(b + PrefetchDistance);
-                Sse.Prefetch0(b + PrefetchDistance + 16);
-            }
+            Sse.Prefetch0(b + PrefetchDistance);
+            Sse.Prefetch0(b + PrefetchDistance + 16);
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }

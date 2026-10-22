@@ -15,6 +15,10 @@ public sealed record ParakeetOptions
 
     /// <summary>STFT padding. <see cref="StftPadMode.Reflect"/> matches the ONNX export; NeMo itself zero-pads.</summary>
     public StftPadMode PadMode { get; init; } = StftPadMode.Reflect;
+
+    /// <summary>Back the 2.4 GB of packed weights with transparent huge pages (Linux). Off by default: the kernel may
+    /// have to compact memory to provide them, which can add seconds to loading on a machine with a busy page cache.</summary>
+    public bool HugePages { get; init; }
 }
 
 /// <summary>A decoded token with its time span.</summary>
@@ -47,7 +51,7 @@ public sealed class ParakeetAsr : IDisposable
         Config = config with { Mel = config.Mel with { PadMode = options.PadMode } };
         Vocabulary = vocabulary;
         Parallelism = new Parallelism(options.Threads);
-        var w = new WeightReader(source);
+        var w = new WeightReader(source, options.HugePages);
         float[]? fb = null, window = null;
         if (source.Contains("preprocessor.featurizer.fb")) fb = source.Get("preprocessor.featurizer.fb").ToArray();
         if (source.Contains("preprocessor.featurizer.window")) window = source.Get("preprocessor.featurizer.window").ToArray();

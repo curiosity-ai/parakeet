@@ -116,7 +116,9 @@ public sealed unsafe class ConformerEncoder : IDisposable
         _layers = new ConformerLayer[cfg.Layers];
         try
         {
-            for (int i = 0; i < cfg.Layers; i++) _layers[i] = ConformerLayer.Load(w, cfg, i);
+            // Layers are independent: read and pack them concurrently (the checkpoint is memory-mapped, so this is
+            // mostly memory-bound transposition plus page faults, which scale with cores).
+            Parallel.For(0, cfg.Layers, i => _layers[i] = ConformerLayer.Load(w, cfg, i));
         }
         catch
         {

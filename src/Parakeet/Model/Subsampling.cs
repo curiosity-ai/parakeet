@@ -52,7 +52,7 @@ internal sealed unsafe class Subsampling : IDisposable
             for (int c = 0; c < _c; c++)
                 for (int f = 0; f < fOut; f++)
                     perm.Ptr[(long)o * k + f * _c + c] = src[o * k + c * fOut + f];
-        _out = PackedMatrix.FromLinear(perm.Ptr, _d, k);
+        _out = PackedMatrix.FromLinear(perm.Ptr, _d, k, hugePages: w.HugePages);
         _outB = w.Vector(p + "out.bias", _d);
     }
 

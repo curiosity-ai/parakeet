@@ -17,7 +17,7 @@ namespace Parakeet.Model;
 /// </summary>
 internal static unsafe class RelPositionAttention
 {
-    private static readonly int RowBlock = int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_RB"), out int rb) ? rb : 64;
+    private const int RowBlock = 64;
     private const int NR = PackedMatrix.NR;
 
     [ThreadStatic] private static NativeBuffer<float>? t_scratch;

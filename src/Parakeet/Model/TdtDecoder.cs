@@ -63,7 +63,7 @@ public sealed unsafe class TdtDecoder : IDisposable
                 wih.Slice(r * h, h).CopyTo(new Span<float>(cat.Ptr + (long)r * 2 * h, h));
                 whh.Slice(r * h, h).CopyTo(new Span<float>(cat.Ptr + (long)r * 2 * h + h, h));
             }
-            _wcat[l - 1] = PackedMatrix.FromLinear(cat.Ptr, g, 2 * h);
+            _wcat[l - 1] = PackedMatrix.FromLinear(cat.Ptr, g, 2 * h, hugePages: w.HugePages);
             var bi = w.Get($"{p}dec_rnn.lstm.bias_ih_l{l}", g).Span;
             var bh = w.Get($"{p}dec_rnn.lstm.bias_hh_l{l}", g).Span;
             _bcat[l - 1] = new NativeBuffer<float>(g);

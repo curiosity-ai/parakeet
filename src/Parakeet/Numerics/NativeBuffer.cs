@@ -8,12 +8,16 @@ public sealed unsafe class NativeBuffer<T> : IDisposable where T : unmanaged
 {
     private T* _ptr;
 
-    public NativeBuffer(long length, bool zero = true)
+    /// <param name="length">Number of elements.</param>
+    /// <param name="zero">Clear the memory (otherwise its contents are undefined).</param>
+    /// <param name="hugePages">On Linux, back large buffers with transparent huge pages (fewer TLB misses and page faults,
+    /// but the kernel may compact memory to provide them, which can stall the first touch for seconds).</param>
+    public NativeBuffer(long length, bool zero = true, bool hugePages = true)
     {
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
         Length = length;
         nuint bytes = (nuint)Math.Max(1, length * sizeof(T));
-        if (bytes >= HugePageThreshold && OperatingSystem.IsLinux())
+        if (hugePages && bytes >= HugePageThreshold && OperatingSystem.IsLinux())
         {
             // Large buffers: 2 MB-aligned and advised as transparent huge pages, so first touch costs one
             // fault per 2 MB instead of per 4 KB (activations at audio rate are hundreds of MB).

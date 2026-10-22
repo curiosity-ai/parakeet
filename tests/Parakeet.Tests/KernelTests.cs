@@ -87,14 +87,14 @@ public sealed unsafe class KernelTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void WorkerPoolRunsEveryItemUnderStress()
+    public async Task WorkerPoolRunsEveryItemUnderStress()
     {
         // Jobs separated by gaps shorter and longer than the workers' spin window exercise the spin, sleep and wake
         // paths; a second caller thread exercises the concurrent-use fallback.
         using var par = new Parallelism(4);
         var task = Task.Run(() => Hammer(par, 7));
         Hammer(par, 3);
-        Assert.True(task.Wait(TimeSpan.FromMinutes(2)), "worker pool hung");
+        await task.WaitAsync(TimeSpan.FromMinutes(2));
 
         static void Hammer(Parallelism par, int seed)
         {

@@ -112,7 +112,6 @@ public static unsafe class KernelBench
             sumT += best; sumF += f;
             parts.Add($"{f / best,5:F0}");
         }
-        Console.WriteLine($"KC={PackedMatrix.KBlock,3} NCP={Environment.GetEnvironmentVariable("PARAKEET_NCP") ?? "16",2} MCT={Environment.GetEnvironmentVariable("PARAKEET_MCT") ?? "40",2}: " +
-                          string.Join(" ", parts) + $"  | avg {sumF / sumT:F0} GFLOP/s");
+        Console.WriteLine($"cold GFLOP/s (M=87/87/462/462, K×N=1024×4096 / 4096×1024): " + string.Join(" ", parts) + $"  | avg {sumF / sumT:F0}");
     }
 }

@@ -15,7 +15,7 @@ public sealed unsafe class PackedMatrix : IDisposable
     public const int NR = 32;
 
     /// <summary>K rows per block (the GEMM's KC).</summary>
-    public static readonly int KBlock = int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_KC"), out int kc) ? kc : 256;
+    public const int KBlock = 256;
 
     private readonly NativeBuffer<float>? _owned;
     private readonly float* _data;
@@ -59,19 +59,19 @@ public sealed unsafe class PackedMatrix : IDisposable
 
     /// <summary>Packs a PyTorch linear weight <c>W[n, k]</c> (row-major, rows <paramref name="ldw"/> apart), scaled by
     /// <paramref name="scale"/> (used to fold constant output scales such as the macaron ½ into the weight).</summary>
-    public static PackedMatrix FromLinear(float* w, int n, int k, long ldw = -1, float scale = 1f)
+    public static PackedMatrix FromLinear(float* w, int n, int k, long ldw = -1, float scale = 1f, bool hugePages = false)
     {
         if (ldw < 0) ldw = k;
-        var buf = new NativeBuffer<float>(SizeOf(k, n));
+        var buf = new NativeBuffer<float>(SizeOf(k, n), zero: false, hugePages);
         PackLinear(w, n, k, ldw, buf.Ptr, scale);
         return new PackedMatrix(k, n, buf);
     }
 
     /// <summary>Packs a row-major matrix <c>B[k, n]</c> (rows <paramref name="ldb"/> apart), e.g. an ONNX MatMul weight.</summary>
-    public static PackedMatrix FromKN(float* b, int k, int n, long ldb = -1, float scale = 1f)
+    public static PackedMatrix FromKN(float* b, int k, int n, long ldb = -1, float scale = 1f, bool hugePages = false)
     {
         if (ldb < 0) ldb = n;
-        var buf = new NativeBuffer<float>(SizeOf(k, n));
+        var buf = new NativeBuffer<float>(SizeOf(k, n), zero: false, hugePages);
         PackKN(b, k, n, ldb, buf.Ptr, scale);
         return new PackedMatrix(k, n, buf);
     }
@@ -122,7 +122,7 @@ public sealed unsafe class PackedMatrix : IDisposable
     }
 
     /// <summary>Concatenates linear weights <c>W_i[n_i, k]</c> along the output dimension (e.g. fused q/k/v).</summary>
-    public static PackedMatrix FromLinears(int k, params (IntPtr Ptr, int Rows)[] parts)
+    public static PackedMatrix FromLinears(int k, bool hugePages, params (IntPtr Ptr, int Rows)[] parts)
     {
         int n = parts.Sum(p => p.Rows);
         using var tmp = new NativeBuffer<float>((long)n * k, zero: false);
@@ -132,7 +132,7 @@ public sealed unsafe class PackedMatrix : IDisposable
             Buffer.MemoryCopy((void*)ptr, tmp.Ptr + off, (long)rows * k * sizeof(float), (long)rows * k * sizeof(float));
             off += (long)rows * k;
         }
-        return FromLinear(tmp.Ptr, n, k);
+        return FromLinear(tmp.Ptr, n, k, hugePages: hugePages);
     }
 
     /// <summary>Unpacks back to a row-major <c>B[K, N]</c> (tests).</summary>
