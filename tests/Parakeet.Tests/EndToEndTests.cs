@@ -15,7 +15,9 @@ public sealed class EndToEndTests(ModelFixture model, ITestOutputHelper output)
         if (!Fixtures.Available(output)) return;
         var asr = model.Asr!;
         double errors = 0, words = 0, audio = 0, time = 0;
-        foreach (var clip in Fixtures.Clips)
+        // parakeet-tdt-0.6b-v2 is English-only (1024 pieces); v3 is multilingual (8192 pieces).
+        bool multilingual = asr.Config.VocabSize > 1024;
+        foreach (var clip in Fixtures.Clips.Where(c => multilingual || c.Language == "english"))
         {
             var r = asr.TranscribeFile(Path.Combine(Fixtures.AudioDir, clip.File));
             string expected = clip.Written ?? clip.Text;
@@ -25,7 +27,7 @@ public sealed class EndToEndTests(ModelFixture model, ITestOutputHelper output)
             words += n;
             audio += r.AudioSeconds;
             time += r.TotalTime.TotalSeconds;
-            output.WriteLine($"{clip.File,-44} WER {wer,6:P1}  {r.Text}");
+            output.WriteLine($"{clip.File,-44} {clip.Language,-10} WER {wer,6:P1}  {r.Text}");
             Assert.True(wer < 0.25, $"{clip.File}: WER {wer:P1}\n  expected: {expected}\n  got:      {r.Text}");
             Assert.NotEmpty(r.Words);
             Assert.True(r.Words.Zip(r.Words.Skip(1)).All(p => p.First.Start <= p.Second.Start), "word times must be ordered");

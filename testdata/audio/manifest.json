@@ -6,7 +6,8 @@
     "Voice": "en-africa-abena-mensah",
     "Region": "africa",
     "Seconds": 11.28,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-africa-babatunde-oyelaran.wav",
@@ -15,7 +16,8 @@
     "Voice": "en-africa-babatunde-oyelaran",
     "Region": "africa",
     "Seconds": 10.32,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-africa-folake-adeyemi.wav",
@@ -24,7 +26,8 @@
     "Voice": "en-africa-folake-adeyemi",
     "Region": "africa",
     "Seconds": 10.8,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-gb-mei-lin-ashcombe.wav",
@@ -33,7 +36,8 @@
     "Voice": "en-gb-mei-lin-ashcombe",
     "Region": "gb",
     "Seconds": 15.2,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-aaliyah-renwick.wav",
@@ -42,7 +46,8 @@
     "Voice": "en-us-aaliyah-renwick",
     "Region": "us",
     "Seconds": 10.8,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-ainsley-garner.wav",
@@ -51,7 +56,8 @@
     "Voice": "en-us-ainsley-garner",
     "Region": "us",
     "Seconds": 11.44,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-alexis-montoya.wav",
@@ -60,7 +66,8 @@
     "Voice": "en-us-alexis-montoya",
     "Region": "us",
     "Seconds": 10.24,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-ambrose-delgado.wav",
@@ -69,7 +76,8 @@
     "Voice": "en-us-ambrose-delgado",
     "Region": "us",
     "Seconds": 16.88,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-ambrose-kettering.wav",
@@ -78,7 +86,8 @@
     "Voice": "en-us-ambrose-kettering",
     "Region": "us",
     "Seconds": 14.32,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-amos-thackeray.wav",
@@ -87,7 +96,8 @@
     "Voice": "en-us-amos-thackeray",
     "Region": "us",
     "Seconds": 13.68,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-annabel-greaves.wav",
@@ -96,7 +106,8 @@
     "Voice": "en-us-annabel-greaves",
     "Region": "us",
     "Seconds": 11.84,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-augustus-pembrook.wav",
@@ -105,7 +116,8 @@
     "Voice": "en-us-augustus-pembrook",
     "Region": "us",
     "Seconds": 15.76,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-brandon-vossler.wav",
@@ -114,7 +126,8 @@
     "Voice": "en-us-brandon-vossler",
     "Region": "us",
     "Seconds": 13.44,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-cornelius-batiste.wav",
@@ -123,7 +136,8 @@
     "Voice": "en-us-cornelius-batiste",
     "Region": "us",
     "Seconds": 11.44,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-desmond-okoro.wav",
@@ -132,7 +146,8 @@
     "Voice": "en-us-desmond-okoro",
     "Region": "us",
     "Seconds": 12.48,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-dottie-bonbon.wav",
@@ -141,7 +156,8 @@
     "Voice": "en-us-dottie-bonbon",
     "Region": "us",
     "Seconds": 10.08,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "sample-en-us-imani-castellow.wav",
@@ -150,7 +166,48 @@
     "Voice": "en-us-imani-castellow",
     "Region": "us",
     "Seconds": 11.04,
-    "Written": null
+    "Written": null,
+    "Language": "english"
+  },
+  {
+    "File": "synth-de.wav",
+    "Text": "Guten Morgen! Das Wetter ist heute sonnig und perfekt f\u00FCr einen Spaziergang im Park.",
+    "Source": "voxwerk-synth",
+    "Voice": "ryan",
+    "Region": "",
+    "Seconds": 5.84,
+    "Written": null,
+    "Language": "german"
+  },
+  {
+    "File": "synth-es.wav",
+    "Text": "El tren de la ma\u00F1ana lleg\u00F3 tarde, pero todos los pasajeros estaban tranquilos.",
+    "Source": "voxwerk-synth",
+    "Voice": "aiden",
+    "Region": "",
+    "Seconds": 5.12,
+    "Written": null,
+    "Language": "spanish"
+  },
+  {
+    "File": "synth-fr.wav",
+    "Text": "Bonjour \u00E0 tous, la r\u00E9union commencera dans dix minutes dans la grande salle.",
+    "Source": "voxwerk-synth",
+    "Voice": "serena",
+    "Region": "",
+    "Seconds": 4.72,
+    "Written": null,
+    "Language": "french"
+  },
+  {
+    "File": "synth-it.wav",
+    "Text": "La biblioteca rester\u00E0 aperta fino alle otto di sera durante tutta la settimana.",
+    "Source": "voxwerk-synth",
+    "Voice": "vivian",
+    "Region": "",
+    "Seconds": 5.52,
+    "Written": null,
+    "Language": "italian"
   },
   {
     "File": "synth-long.wav",
@@ -159,7 +216,8 @@
     "Voice": "ryan",
     "Region": "",
     "Seconds": 36.88,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "synth-numbers.wav",
@@ -168,7 +226,28 @@
     "Voice": "serena",
     "Region": "",
     "Seconds": 8.16,
-    "Written": "The meeting was moved to 3:30 on Tuesday, and we expect about 250 people to attend."
+    "Written": "The meeting was moved to 3:30 on Tuesday, and we expect about 250 people to attend.",
+    "Language": "english"
+  },
+  {
+    "File": "synth-pt.wav",
+    "Text": "O mercado da cidade vende frutas frescas e p\u00E3o quente todas as manh\u00E3s.",
+    "Source": "voxwerk-synth",
+    "Voice": "ryan",
+    "Region": "",
+    "Seconds": 6.16,
+    "Written": null,
+    "Language": "portuguese"
+  },
+  {
+    "File": "synth-ru.wav",
+    "Text": "\u0421\u0435\u0433\u043E\u0434\u043D\u044F \u0432\u0435\u0447\u0435\u0440\u043E\u043C \u043C\u044B \u0431\u0443\u0434\u0435\u043C \u0441\u043C\u043E\u0442\u0440\u0435\u0442\u044C \u0444\u0438\u043B\u044C\u043C \u0432\u043C\u0435\u0441\u0442\u0435 \u0441 \u0434\u0440\u0443\u0437\u044C\u044F\u043C\u0438.",
+    "Source": "voxwerk-synth",
+    "Voice": "serena",
+    "Region": "",
+    "Seconds": 4.16,
+    "Written": null,
+    "Language": "russian"
   },
   {
     "File": "synth-science.wav",
@@ -177,7 +256,8 @@
     "Voice": "aiden",
     "Region": "",
     "Seconds": 6.48,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "synth-story.wav",
@@ -186,7 +266,8 @@
     "Voice": "vivian",
     "Region": "",
     "Seconds": 10.56,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "synth-tech.wav",
@@ -195,7 +276,8 @@
     "Voice": "eric",
     "Region": "",
     "Seconds": 6.96,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   },
   {
     "File": "synth-weather.wav",
@@ -204,6 +286,7 @@
     "Voice": "ryan",
     "Region": "",
     "Seconds": 6.88,
-    "Written": null
+    "Written": null,
+    "Language": "english"
   }
 ]

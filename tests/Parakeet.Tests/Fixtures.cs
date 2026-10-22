@@ -102,6 +102,7 @@ public static class Fixtures
 public sealed record Clip(string File, string Text, string Source, string Voice, string Region, double Seconds)
 {
     public string? Written { get; init; }
+    public string Language { get; init; } = "english";
 }
 
 public sealed record ReferenceResult(string Wav, int Samples, int FeatureFrames, int EncodedFrames, string Text, int[] Tokens, int[] Frames, int[] Durations);
