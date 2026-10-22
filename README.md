@@ -20,19 +20,22 @@ workflows are disabled); it was used as the reference implementation for the por
 ## Quick start
 
 ```bash
-# Transcribe (downloads nvidia/parakeet-tdt-0.6b-v2 to ~/.cache/parakeet on first use, 2.5 GB)
+# Transcribe (downloads parakeet-tdt-0.6b-v2 to ~/.cache/parakeet on first use, 2.5 GB)
 dotnet run -c Release --project src/Parakeet.Cli -- transcribe audio.wav
 
 # Multilingual model, word timestamps
-dotnet run -c Release --project src/Parakeet.Cli -- transcribe --model nvidia/parakeet-tdt-0.6b-v3 --words audio.wav
+dotnet run -c Release --project src/Parakeet.Cli -- transcribe --model v3 --words audio.wav
 
 # A local .nemo file, an extracted .nemo directory, or the ONNX export directory work too
 dotnet run -c Release --project src/Parakeet.Cli -- transcribe --model ./parakeet-tdt-0.6b-v2.nemo --json a.wav b.wav
+
+# Only download (e.g. to pre-populate a cache or a container image); prints the path
+dotnet run -c Release --project src/Parakeet.Cli -- download --model v3 [--out /models/parakeet-tdt-0.6b-v3.nemo]
 ```
 
 | Option | Meaning |
 |---|---|
-| `--model <path\|repo>` | `.nemo` file, extracted NeMo directory, ONNX export directory, or Hugging Face repo (default `nvidia/parakeet-tdt-0.6b-v2`) |
+| `--model <name\|path>` | `v2` (English, default) or `v3` (multilingual), also as `nvidia/parakeet-tdt-0.6b-v3`; or a local `.nemo` file, extracted NeMo directory or ONNX export directory |
 | `--threads <n>` | Worker threads (default: all cores; `1` = single core) |
 | `--int8` | Int8 encoder projections on AVX-VNNI: about twice as fast, approximate (see [Int8](#int8-mode)) |
 | `--zero-pad` | Zero-pad the STFT like NeMo itself (default: reflection, like the ONNX export) |
@@ -44,7 +47,8 @@ dotnet run -c Release --project src/Parakeet.Cli -- transcribe --model ./parakee
 ```csharp
 using Parakeet;
 
-using var asr = await ParakeetAsr.LoadAsync();                  // or ParakeetAsr.Load("/path/to/model.nemo")
+using var asr = await ParakeetAsr.LoadAsync();                  // v2; LoadAsync(ParakeetModel.TdtV3) for multilingual,
+                                                                // or ParakeetAsr.Load("/path/to/model.nemo")
 var result = asr.TranscribeFile("audio.wav");                   // any WAV: resampled to 16 kHz mono
 Console.WriteLine(result.Text);
 foreach (var w in result.Words) Console.WriteLine($"{w.Start:F2}-{w.End:F2} {w.Text}");
@@ -55,6 +59,20 @@ var r = asr.Transcribe(samples, onText: delta => Console.Write(delta));   // str
 ```
 
 `ParakeetOptions` sets `Threads`, `Precision` (`Float32` / `Int8`), `PadMode`, `PositionCacheFrames` and `HugePages`.
+
+### Model download
+
+`ParakeetAsr.LoadAsync(ParakeetModel model, options, modelUrl, downloadToPath, reportProgress)` downloads the
+checkpoint once and loads it; `ParakeetAsr.DownloadModelAsync(model, downloadToPath, reportProgress)` only downloads.
+Files are cached in `~/.cache/parakeet` (or `$PARAKEET_CACHE`). The catalog in `ParakeetModels` (repository, file
+name, exact size, URL) points at the `.nemo` files on Hugging Face for now; `ParakeetModels.GetDownloadUrl` is the one
+place to switch to another host serving the same files, and `modelUrl` overrides it per call.
+
+The downloader (`IO/ModelDownloader.cs`, same design as the EmbeddingGemma2 one in sentence-transformers-sharp)
+streams to a `*.download` file and renames it only when complete and of the expected size, so a truncated file is
+never mistaken for a model. A dropped connection is retried with HTTP range requests, a `*.download` left by an
+interrupted process is resumed, and a cached file of the wrong size is fetched again. Downloads are single-flight
+across the process, progress is reported as `DownloadProgress` (~2 Hz), and `$HF_TOKEN` is sent to huggingface.co.
 One `ParakeetAsr` instance is thread-safe and can serve concurrent `Transcribe` calls. The stages are public as well:
 `MelSpectrogram` (features), `ConformerEncoder` (with a per-layer `TraceCallback`), `TdtDecoder` (with a per-step
 `StepCallback`), `NemoArchive` / `OnnxModelSource` (checkpoint readers), `WaveFile` / `Resampler`.
@@ -174,7 +192,8 @@ dotnet run -c Release --project tools/Parakeet.TestAudio -- synth --out testdata
 ### Running the tests
 
 ```bash
-dotnet test -c Release        # kernel tests; model tests skip (and say so) without the environment below
+dotnet test -c Release        # kernel and downloader tests; model tests skip (and say so) without the environment below
+PARAKEET_NETWORK_TESTS=1 dotnet test -c Release --filter PublishedSizes   # checks the catalog against the download URLs
 
 # Reference dumps from ONNX Runtime (Python: numpy onnx onnxruntime)
 python scripts/onnx_reference.py --models /path/to/parakeet-tdt-0.6b-v2-onnx --out /tmp/ref testdata/audio/*.wav

@@ -109,12 +109,61 @@ public sealed class ParakeetAsr : IDisposable
         return new ParakeetAsr(archive, archive.Config, new Vocabulary(archive.Vocabulary), options);
     }
 
-    /// <summary>Loads a local model, or downloads a Hugging Face repository's <c>.nemo</c> checkpoint first.</summary>
-    public static async Task<ParakeetAsr> LoadAsync(string modelOrRepo = ModelDownloader.DefaultRepo, ParakeetOptions? options = null,
-                                                    IProgress<string>? progress = null, CancellationToken ct = default)
+    /// <summary>
+    /// Downloads a published checkpoint (once: it is cached at <paramref name="downloadToPath"/>, by default
+    /// <see cref="ParakeetModels.GetDefaultCachePath"/>) and loads it.
+    /// </summary>
+    /// <param name="model">Which checkpoint: English v2 (default) or multilingual v3.</param>
+    /// <param name="options">Load options (threads, precision, ...).</param>
+    /// <param name="modelUrl">Override the download URL (defaults to <see cref="ParakeetModels.GetDownloadUrl"/>). The size of
+    /// the published file is only enforced for the default URL.</param>
+    /// <param name="downloadToPath">Where to cache the <c>.nemo</c> file.</param>
+    /// <param name="reportProgress">Optional download progress callback (~2 Hz).</param>
+    /// <param name="cancellationToken">Cancels the download.</param>
+    public static async Task<ParakeetAsr> LoadAsync(ParakeetModel model = ParakeetModel.TdtV2, ParakeetOptions? options = null,
+                                                    string? modelUrl = null, string? downloadToPath = null,
+                                                    Action<DownloadProgress>? reportProgress = null,
+                                                    CancellationToken cancellationToken = default)
     {
-        string path = await ModelDownloader.EnsureAsync(modelOrRepo, progress: progress, ct: ct).ConfigureAwait(false);
-        return Load(path, options);
+        string path = downloadToPath ?? ParakeetModels.GetDefaultCachePath(model);
+        string url = modelUrl ?? ParakeetModels.GetDownloadUrl(model);
+        long? size = modelUrl is null ? ParakeetModels.GetFileSize(model) : null;
+        await ModelDownloader.DownloadFileAsync(url, path, reportProgress, size, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return Load(path, options);
+        }
+        catch (InvalidDataException)
+        {
+            // A corrupt cached checkpoint (e.g. truncated by an older version): fetch it again once.
+            try { File.Delete(path); } catch { /* ignore */ }
+            await ModelDownloader.DownloadFileAsync(url, path, reportProgress, size, cancellationToken).ConfigureAwait(false);
+            return Load(path, options);
+        }
+    }
+
+    /// <summary>Loads a local model (see <see cref="Load"/>), or downloads and loads a published one named by
+    /// <paramref name="modelOrPath"/> (<c>v2</c>, <c>v3</c>, <c>nvidia/parakeet-tdt-0.6b-v3</c>, ... see
+    /// <see cref="ParakeetModels.TryParse"/>).</summary>
+    public static Task<ParakeetAsr> LoadAsync(string modelOrPath, ParakeetOptions? options = null,
+                                              Action<DownloadProgress>? reportProgress = null, CancellationToken cancellationToken = default)
+    {
+        if (File.Exists(modelOrPath) || Directory.Exists(modelOrPath)) return Task.FromResult(Load(modelOrPath, options));
+        if (ParakeetModels.TryParse(modelOrPath, out var model))
+            return LoadAsync(model, options, reportProgress: reportProgress, cancellationToken: cancellationToken);
+        throw new ArgumentException($"'{modelOrPath}' is neither a local model path nor a known model " +
+                                    $"({string.Join(", ", Enum.GetValues<ParakeetModel>().Select(ParakeetModels.GetRepository))}).",
+                                    nameof(modelOrPath));
+    }
+
+    /// <summary>Downloads a published checkpoint without loading it (e.g. to pre-populate a cache) and returns its path.</summary>
+    public static async Task<string> DownloadModelAsync(ParakeetModel model, string? downloadToPath = null,
+                                                        Action<DownloadProgress>? reportProgress = null, CancellationToken cancellationToken = default)
+    {
+        string path = downloadToPath ?? ParakeetModels.GetDefaultCachePath(model);
+        await ModelDownloader.DownloadFileAsync(ParakeetModels.GetDownloadUrl(model), path, reportProgress,
+                                                ParakeetModels.GetFileSize(model), cancellationToken).ConfigureAwait(false);
+        return path;
     }
 
     /// <summary>Transcribes a WAV file (any sample rate / channel count).</summary>

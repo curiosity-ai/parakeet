@@ -1,93 +1,155 @@
 using System.Net.Http.Headers;
-using System.Text.Json;
 
 namespace Parakeet.IO;
 
-/// <summary>Fetches a Parakeet checkpoint from the Hugging Face Hub (the repository's <c>.nemo</c> file) into a local
-/// cache, resuming interrupted downloads and verifying the final size.</summary>
+/// <summary>Progress of a model download: bytes received so far, the total when known, and their ratio (0 when unknown).</summary>
+public sealed record DownloadProgress(long DownloadedBytes, long? TotalBytes, float Fraction, string FileName);
+
+/// <summary>
+/// Resumable, single-flight model downloader. Files are streamed to a <c>*.download</c> sibling and only moved to their
+/// final name once complete (and, when known, of the expected size), so an interrupted download never leaves a truncated
+/// file that a later run would mistake for a model. A dropped connection is retried with HTTP range requests, and a
+/// <c>*.download</c> left by an interrupted process is resumed rather than started over.
+/// </summary>
 public static class ModelDownloader
 {
-    public const string DefaultRepo = "nvidia/parakeet-tdt-0.6b-v2";
+    private static readonly SemaphoreSlim OneDownloadAtATime = new(1, 1);
+    private static readonly HttpClient Client = CreateClient();
 
-    /// <summary>Default cache location: <c>$PARAKEET_CACHE</c> or <c>~/.cache/parakeet</c>.</summary>
-    public static string DefaultCacheDir =>
-        Environment.GetEnvironmentVariable("PARAKEET_CACHE") is { Length: > 0 } c
-            ? c
-            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "parakeet");
-
-    /// <summary>Returns <paramref name="modelOrRepo"/> when it is an existing file or directory, otherwise downloads the
-    /// repository's <c>.nemo</c> checkpoint (skipping a complete local copy) and returns its path.</summary>
-    public static async Task<string> EnsureAsync(string modelOrRepo, string? cacheDir = null, IProgress<string>? progress = null,
-                                                 CancellationToken ct = default)
+    private static HttpClient CreateClient()
     {
-        if (File.Exists(modelOrRepo) || Directory.Exists(modelOrRepo)) return modelOrRepo;
-        string dir = Path.Combine(cacheDir ?? DefaultCacheDir, modelOrRepo.Replace('/', Path.DirectorySeparatorChar));
-        Directory.CreateDirectory(dir);
-        using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        if (Environment.GetEnvironmentVariable("HF_TOKEN") is { Length: > 0 } token)
-            http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-        var (file, size) = await FindNemoFileAsync(http, modelOrRepo, ct).ConfigureAwait(false);
-        string dest = Path.Combine(dir, file);
-        if (File.Exists(dest) && (size <= 0 || ResolvedLength(dest) == size)) return dest;
-
-        string partial = dest + ".partial";
-        string url = $"https://huggingface.co/{modelOrRepo}/resolve/main/{file}";
-        for (int attempt = 1; ; attempt++)
-        {
-            long have = File.Exists(partial) ? new FileInfo(partial).Length : 0;
-            try
-            {
-                progress?.Report($"Downloading {modelOrRepo}/{file} ({FormatSize(size)}){(have > 0 ? $", resuming at {FormatSize(have)}" : "")} ...");
-                using var req = new HttpRequestMessage(HttpMethod.Get, url);
-                if (have > 0) req.Headers.Range = new RangeHeaderValue(have, null);
-                using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-                resp.EnsureSuccessStatusCode();
-                bool append = have > 0 && resp.StatusCode == System.Net.HttpStatusCode.PartialContent;
-                await using (var fs = new FileStream(partial, append ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
-                await using (var body = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
-                    await body.CopyToAsync(fs, 1 << 20, ct).ConfigureAwait(false);
-                long got = new FileInfo(partial).Length;
-                if (size > 0 && got != size) throw new IOException($"download incomplete ({got} of {size} bytes)");
-                File.Move(partial, dest, overwrite: true);
-                return dest;
-            }
-            catch (Exception e) when (attempt < 5 && e is IOException or HttpRequestException && !ct.IsCancellationRequested)
-            {
-                progress?.Report($"Download interrupted ({e.Message}), retrying ...");
-                await Task.Delay(TimeSpan.FromSeconds(2 << attempt), ct).ConfigureAwait(false);
-            }
-        }
+        var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("Parakeet.NET/1.0");
+        return client;
     }
 
-    private static async Task<(string File, long Size)> FindNemoFileAsync(HttpClient http, string repo, CancellationToken ct)
+    /// <summary>Returns true while a download is in progress.</summary>
+    public static bool IsDownloading() => OneDownloadAtATime.CurrentCount < 1;
+
+    /// <summary>
+    /// Downloads <paramref name="url"/> to <paramref name="localPath"/> unless the file already exists (and, when
+    /// <paramref name="expectedSize"/> is given, has exactly that size). Retries with HTTP range requests when the
+    /// connection drops. Sends <c>$HF_TOKEN</c> as a bearer token to huggingface.co, for gated repositories.
+    /// </summary>
+    public static async Task DownloadFileAsync(string url, string localPath, Action<DownloadProgress>? reportProgress = null,
+                                               long? expectedSize = null, CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(localPath)) throw new ArgumentException("Local path must be non-empty.", nameof(localPath));
+        if (IsComplete(localPath, expectedSize)) return;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme is not ("https" or "http"))
+            throw new InvalidOperationException($"Invalid model URL: '{url}'. Use a valid http(s) URL.");
+        string? directory = Path.GetDirectoryName(Path.GetFullPath(localPath));
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+
+        string fileName = Path.GetFileName(localPath);
+        string tempPath = localPath + ".download";
+        long? totalBytes = expectedSize;
+
+        await OneDownloadAtATime.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            using var resp = await http.GetAsync($"https://huggingface.co/api/models/{repo}/tree/main", ct).ConfigureAwait(false);
-            resp.EnsureSuccessStatusCode();
-            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
-            foreach (var e in doc.RootElement.EnumerateArray())
+            if (IsComplete(localPath, expectedSize)) return;   // another caller finished it while we waited
+            if (File.Exists(localPath)) File.Delete(localPath); // wrong size: a leftover of an older or corrupt download
+
+            await using var fileStream = new FileStream(tempPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None, 1 << 20, useAsync: true);
+            long received = fileStream.Length;
+            if (expectedSize is long want && received > want) received = 0;   // not a prefix of this file
+            fileStream.SetLength(received);
+            fileStream.Position = received;
+
+            var buffer = new byte[1 << 20];
+            long lastReport = 0;
+            int failures = 0;
+            Report(received);
+            while (true)
             {
-                string path = e.GetProperty("path").GetString() ?? "";
-                if (path.EndsWith(".nemo", StringComparison.Ordinal))
-                    return (path, e.TryGetProperty("size", out var s) ? s.GetInt64() : -1);
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+                    if (uri.Host.EndsWith("huggingface.co", StringComparison.OrdinalIgnoreCase) &&
+                        Environment.GetEnvironmentVariable("HF_TOKEN") is { Length: > 0 } token)
+                        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                    if (received > 0) request.Headers.Range = new RangeHeaderValue(received, null);
+                    using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                    if (received > 0 && response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+                    {
+                        if (expectedSize is long full && received == full) break;   // the partial file is already complete
+                        received = 0;                                              // stale partial file: start over
+                        fileStream.SetLength(0);
+                        fileStream.Position = 0;
+                        if (++failures > 20) throw new IOException($"Download of '{fileName}' keeps failing (HTTP 416).");
+                        continue;
+                    }
+                    response.EnsureSuccessStatusCode();
+                    if (received > 0 && response.StatusCode != System.Net.HttpStatusCode.PartialContent)
+                    {
+                        // The server ignored the range: start over.
+                        received = 0;
+                        fileStream.SetLength(0);
+                        fileStream.Position = 0;
+                    }
+                    if (response.Content.Headers.ContentLength is long len) totalBytes = received + len;
+
+                    await using var content = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                    int read;
+                    while ((read = await content.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+                    {
+                        await fileStream.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                        received += read;
+                        long now = Environment.TickCount64;
+                        if (now - lastReport >= 500)
+                        {
+                            lastReport = now;
+                            Report(received);
+                        }
+                    }
+                    if (totalBytes is long expected && received < expected)
+                        throw new IOException($"Download of '{fileName}' ended prematurely: received {received} of {expected} bytes.");
+                    break;
+                }
+                catch (Exception ex) when (ex is IOException or HttpRequestException && !cancellationToken.IsCancellationRequested)
+                {
+                    if (ex is HttpRequestException { StatusCode: { } code } && (int)code is >= 400 and < 500 and not 408 and not 429)
+                        throw;   // not found, unauthorized, ...: retrying will not help
+                    if (++failures > 20) throw;
+                    await fileStream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, 2 * failures)), cancellationToken).ConfigureAwait(false);
+                }
             }
-            throw new FileNotFoundException($"Repository {repo} has no .nemo file.");
+            Report(received);
+            await fileStream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            fileStream.Close();
+
+            long got = new FileInfo(tempPath).Length;
+            if (expectedSize is long size && got != size)
+            {
+                File.Delete(tempPath);
+                throw new InvalidDataException($"Downloaded '{fileName}' has {got} bytes, expected {size}.");
+            }
+            File.Move(tempPath, localPath, overwrite: true);
         }
-        catch (HttpRequestException)
+        finally
         {
-            // Offline / API unavailable: fall back to the conventional file name.
-            return (repo[(repo.LastIndexOf('/') + 1)..] + ".nemo", -1);
+            // A failed or cancelled transfer keeps its .download file, so the next attempt resumes it.
+            OneDownloadAtATime.Release();
+        }
+
+        void Report(long done)
+        {
+            if (reportProgress is null) return;
+            float fraction = totalBytes is long total && total > 0 ? Math.Clamp(done / (float)total, 0f, 1f) : 0f;
+            reportProgress(new DownloadProgress(done, totalBytes, fraction, fileName));
         }
     }
 
-    /// <summary>Length of the file, following a symbolic link (FileInfo.Length reports the link itself).</summary>
-    private static long ResolvedLength(string path)
+    /// <summary>True when <paramref name="path"/> exists and, if a size is expected, has it (following symbolic links:
+    /// <c>FileInfo.Length</c> reports a link's own size).</summary>
+    private static bool IsComplete(string path, long? expectedSize)
     {
+        if (!File.Exists(path)) return false;
+        if (expectedSize is not long size) return true;
         var fi = new FileInfo(path);
-        return (fi.LinkTarget != null ? fi.ResolveLinkTarget(true) as FileInfo : null)?.Length ?? fi.Length;
+        long length = (fi.LinkTarget != null ? fi.ResolveLinkTarget(true) as FileInfo : null)?.Length ?? fi.Length;
+        return length == size;
     }
-
-    private static string FormatSize(long bytes) => bytes <= 0 ? "unknown size" : $"{bytes / 1e9:F2} GB";
 }

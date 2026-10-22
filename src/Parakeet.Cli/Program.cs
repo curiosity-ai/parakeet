@@ -4,18 +4,21 @@ using Parakeet;
 using Parakeet.Audio;
 using Parakeet.IO;
 
-// parakeet transcribe [--model path|repo] [--threads n] [--json] [--words] file.wav ...
-// parakeet bench      [--model path|repo] [--threads n] [--runs n] file.wav ...
+// parakeet transcribe [--model v2|v3|path] [--threads n] [--json] [--words] file.wav ...
+// parakeet bench      [--model v2|v3|path] [--threads n] [--runs n] file.wav ...
+// parakeet download   [--model v2|v3] [--out path]
 
 if (args.Length == 0 || args[0] is "-h" or "--help")
 {
     Console.WriteLine("""
         usage: parakeet transcribe [options] <file.wav>...
                parakeet bench      [options] <file.wav>...
+               parakeet download   [--model v2|v3] [--out <path>]
 
         options:
-          --model <path|repo>   .nemo file, NeMo / ONNX export directory, or Hugging Face repo
-                                (default: nvidia/parakeet-tdt-0.6b-v2, downloaded to ~/.cache/parakeet)
+          --model <name|path>   v2 (English, default) or v3 (multilingual), also as nvidia/parakeet-tdt-0.6b-v3,
+                                downloaded once to ~/.cache/parakeet ($PARAKEET_CACHE); or a local .nemo file,
+                                extracted NeMo directory or ONNX export directory
           --threads <n>         worker threads (default: all cores)
           --runs <n>            bench: timed runs per file (default 3, after one warm-up)
           --zero-pad            NeMo-style zero padding for the STFT (default: reflect, like the ONNX export)
@@ -28,7 +31,8 @@ if (args.Length == 0 || args[0] is "-h" or "--help")
 
 string command = args[0];
 var files = new List<string>();
-string model = ModelDownloader.DefaultRepo;
+string model = "v2";
+string? outPath = null;
 int threads = 0, runs = 3;
 bool json = false, words = false, zeroPad = false, int8 = false;
 for (int i = 1; i < args.Length; i++)
@@ -36,6 +40,7 @@ for (int i = 1; i < args.Length; i++)
     switch (args[i])
     {
         case "--model": model = args[++i]; break;
+        case "--out": outPath = args[++i]; break;
         case "--threads": threads = int.Parse(args[++i]); break;
         case "--runs": runs = int.Parse(args[++i]); break;
         case "--json": json = true; break;
@@ -45,20 +50,48 @@ for (int i = 1; i < args.Length; i++)
         default: files.Add(args[i]); break;
     }
 }
+// Download progress on one stderr line, refreshed by the downloader (~2 Hz).
+Action<DownloadProgress> progress = p =>
+{
+    string total = p.TotalBytes is long t ? $" of {t / 1e9:F2} GB ({p.Fraction:P0})" : "";
+    Console.Error.Write($"\rDownloading {p.FileName}: {p.DownloadedBytes / 1e9:F2} GB{total}   ");
+    if (p.TotalBytes is long all && p.DownloadedBytes >= all) Console.Error.WriteLine();
+};
+
+if (command == "download")
+{
+    if (!ParakeetModels.TryParse(model, out var which))
+    {
+        Console.Error.WriteLine($"unknown model '{model}' (use v2 or v3)");
+        return 1;
+    }
+    string path = await ParakeetAsr.DownloadModelAsync(which, outPath, progress);
+    Console.WriteLine(path);
+    return 0;
+}
 if (files.Count == 0)
 {
     Console.Error.WriteLine("no input files");
     return 1;
 }
 
-var progress = new Progress<string>(m => Console.Error.WriteLine(m));
 var sw = Stopwatch.StartNew();
-using var asr = await ParakeetAsr.LoadAsync(model, new ParakeetOptions
+ParakeetAsr asr;
+try
 {
-    Threads = threads,
-    PadMode = zeroPad ? StftPadMode.Constant : StftPadMode.Reflect,
-    Precision = int8 ? Parakeet.Numerics.WeightPrecision.Int8 : Parakeet.Numerics.WeightPrecision.Float32,
-}, progress);
+    asr = await ParakeetAsr.LoadAsync(model, new ParakeetOptions
+    {
+        Threads = threads,
+        PadMode = zeroPad ? StftPadMode.Constant : StftPadMode.Reflect,
+        Precision = int8 ? Parakeet.Numerics.WeightPrecision.Int8 : Parakeet.Numerics.WeightPrecision.Float32,
+    }, progress);
+}
+catch (ArgumentException e)
+{
+    Console.Error.WriteLine(e.Message);
+    return 1;
+}
+using var _ = asr;
 Console.Error.WriteLine($"Loaded in {sw.Elapsed.TotalSeconds:F1}s ({asr.Config.Layers} layers, d={asr.Config.DModel}, vocab {asr.Config.VocabSize}, {asr.Parallelism.MaxThreads} threads, {asr.Precision})");
 
 switch (command)
