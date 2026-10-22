@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Voxwerk" Version="26.10.6704" />
+    <PackageReference Include="Voxwerk.Voices.English.Samples" Version="26.10.6704" />
+  </ItemGroup>
+
+</Project>

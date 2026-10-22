@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Parakeet.Cli</AssemblyName>
+    <PackageId>Parakeet.Cli</PackageId>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>parakeet</ToolCommandName>
+    <Description>Command-line speech recognition with NVIDIA Parakeet TDT in pure C# (.NET 10).</Description>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Parakeet\Parakeet.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,30 +1,14 @@
-# Binaries
 bin/
-*.exe
-
-# Models (downloaded separately)
-models/*
-!models/.gitkeep
-
-# Test audio files
-.test/
-.audio.test/
-
-# IDE
+obj/
+*.user
+.vs/
 .idea/
 .vscode/
 *.swp
-
-# AI assistants
-.crush/
-.cursor/
-.aider/
-.continue/
-.codeium/
-.tabnine/
-.copilot/
-.claude/
-
-# OS
+TestResults/
+packages/
+/models/
+.venv*/
+__pycache__/
+*.partial
 .DS_Store
-Thumbs.db

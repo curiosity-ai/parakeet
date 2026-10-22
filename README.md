@@ -1,624 +1,276 @@
-<div align="center">
-  <img src="docs/img/parakeet.png" width="120">
-  <h1>Parakeet</h1>
-  <p>A high-performance automatic speech recognition (ASR) server written in Go.<br>
-  It uses NVIDIA's Parakeet TDT 0.6B model through ONNX Runtime to provide speech-to-text transcription via an OpenAI Whisper-compatible API.</p>
-</div>
+# Parakeet (pure C#)
 
-<br>
+Pure C# (.NET 10) inference for NVIDIA's **[Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)**
+speech recognition models, `v2` (English) and `v3` (25 European languages), as a library plus a command-line tool.
 
-## Table of Contents
+- **No native dependencies**: no ONNX Runtime, no Python, no BLAS. The log-mel front end, the FastConformer
+  encoder, the Token-and-Duration Transducer decoder, the checkpoint readers and the SIMD kernels are all managed
+  code (`System.Runtime.Intrinsics`, `Span<T>`, `System.Numerics.Tensors`).
+- **Loads the official checkpoint**: the `.nemo` file NVIDIA publishes (a tar archive holding a PyTorch zip and a
+  pickle, all parsed in C# and memory-mapped), or the ONNX export used by the original Go server.
+- **Validated layer by layer against ONNX Runtime**: every encoder layer matches to ~1e-6 relative error, and every
+  test clip gives a **token-identical** transcript (23/23 for v2, 29/29 for v3 in 7 languages). See [Validation](#validation).
+- **Faster than ONNX Runtime** on the same CPU and thread count: **1.22× end to end** in exact FP32 (encoder 1.12×,
+  decoder 2.8×), also single-threaded (1.14×). The opt-in int8 mode on AVX-VNNI is **2.2×** faster than ONNX Runtime
+  running either its FP32 or its int8 export, with transcripts identical to FP32 on v2. See [Performance](#performance).
 
-- [Overview](#overview)
-- [Model Architecture](#model-architecture)
-- [Parakeet vs Whisper](#parakeet-vs-whisper)
-- [Requirements](#requirements)
-  - [Installing ONNX Runtime](#installing-onnx-runtime)
-- [Installation](#installation)
-  - [From Release Binary](#from-release-binary)
-  - [From Source](#from-source)
-  - [Using Docker](#using-docker)
-- [Configuration](#configuration)
-  - [Command Line Flags](#command-line-flags)
-  - [Environment Variables](#environment-variables)
-  - [Model Files](#model-files)
-- [API Reference](#api-reference)
-  - [Transcribe Audio](#transcribe-audio)
-  - [Streaming](#streaming)
-- [Development](#development)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
+The original Go/ONNX Runtime server this repository started from is kept in [`.reference/`](.reference) (its CI
+workflows are disabled); it was used as the reference implementation for the port.
 
-## Overview
-
-Parakeet ASR Server provides a lightweight, production-ready speech recognition service without Python dependencies. It exposes an API compatible with OpenAI's Whisper, making it a drop-in replacement for applications already using that interface.
-
-Key features:
-
-- OpenAI Whisper-compatible REST API
-- API key authentication (optional, via environment variable)
-- Streaming transcriptions via Server-Sent Events (OpenAI-compatible `transcript.text.delta` / `transcript.text.done`)
-- ONNX Runtime inference (CPU)
-- No Python dependency at runtime (ffmpeg is an optional system dependency for non-WAV audio)
-- Structured logging with `slog` (text and JSON formats, configurable log level)
-- Support for multiple response formats (JSON, text, SRT, VTT)
-- Multilingual support (English and 25+ languages)
-- Quantized model support for reduced memory footprint
-- Automatic audio conversion for non-WAV formats (MP3, OGG, WebM, FLAC, M4A, AAC, Opus, ...) when ffmpeg is installed
-
-## Model Architecture
-
-This server uses the [NVIDIA Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) model, converted to ONNX format by [istupakov](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx).
-
-The architecture consists of:
-
-- **Encoder**: Conformer-based encoder with 1024-dimensional output. Processes 128-dimensional mel filterbank features with 8x temporal subsampling.
-- **Decoder**: Token-and-Duration Transducer (TDT) decoder that jointly predicts tokens and their durations. Uses a 2-layer LSTM with 640-dimensional hidden state.
-- **Vocabulary**: 8193 SentencePiece tokens including a blank token for CTC-style decoding.
-
-The int8 quantized models require approximately 670MB of disk space and 2GB of RAM during inference.
-
-## Parakeet vs Whisper
-
-| Aspect        | Parakeet TDT                    | OpenAI Whisper                        |
-| ------------- | ------------------------------- | ------------------------------------- |
-| Architecture  | Conformer encoder + TDT decoder | Transformer encoder-decoder           |
-| Decoding      | Non-autoregressive (parallel)   | Autoregressive (sequential)           |
-| Speed         | Faster inference due to TDT     | Slower due to autoregressive decoding |
-| Model size    | 0.6B parameters                 | 0.04B - 1.5B parameters               |
-| Training data | NeMo ASR datasets               | 680K hours web audio                  |
-| Primary focus | Accuracy and speed balance      | Multilingual robustness               |
-| Timestamps    | Duration-based prediction       | Attention-based alignment             |
-
-Parakeet TDT uses Token-and-Duration Transducer decoding, which predicts both the token and how many encoder frames to advance in a single step. This allows for faster inference compared to traditional autoregressive decoders while maintaining competitive accuracy.
-
-## Requirements
-
-- **ONNX Runtime 1.25.x or later** (required at runtime)
-- Parakeet TDT ONNX models (downloaded separately)
-- **ffmpeg** (optional) — enables automatic conversion of MP3, OGG, WebM, FLAC, M4A, AAC, Opus and any other ffmpeg-supported format. When ffmpeg is not present, only WAV input is accepted and non-WAV uploads return a 400 error. The official Docker image already ships with ffmpeg.
-
-For building from source:
-
-- Go 1.25 or later
-
-### Installing ONNX Runtime
-
-ONNX Runtime is required to run the inference. Choose the installation method for your Linux distribution:
-
-#### Ubuntu / Debian
+## Quick start
 
 ```bash
-# Option 1: Download from GitHub releases (recommended)
-curl -L -o onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.25.1/onnxruntime-linux-x64-1.25.1.tgz"
-tar xzf onnxruntime.tgz
-sudo cp onnxruntime-linux-x64-1.25.1/lib/* /usr/local/lib/
-sudo ldconfig
+# Transcribe (downloads parakeet-tdt-0.6b-v2 to ~/.cache/parakeet on first use, 2.5 GB)
+dotnet run -c Release --project src/Parakeet.Cli -- transcribe audio.wav
 
-# Option 2: Using apt (if available in your version)
-sudo apt update
-sudo apt install libonnxruntime-dev
+# Multilingual model, word timestamps
+dotnet run -c Release --project src/Parakeet.Cli -- transcribe --model v3 --words audio.wav
+
+# A local .nemo file, an extracted .nemo directory, or the ONNX export directory work too
+dotnet run -c Release --project src/Parakeet.Cli -- transcribe --model ./parakeet-tdt-0.6b-v2.nemo --json a.wav b.wav
+
+# Only download (e.g. to pre-populate a cache or a container image); prints the path
+dotnet run -c Release --project src/Parakeet.Cli -- download --model v3 [--out /models/parakeet-tdt-0.6b-v3.nemo]
 ```
 
-#### Fedora / RHEL / CentOS
+| Option | Meaning |
+|---|---|
+| `--model <name\|path>` | `v2` (English, default) or `v3` (multilingual), also as `nvidia/parakeet-tdt-0.6b-v3`; or a local `.nemo` file, extracted NeMo directory or ONNX export directory |
+| `--threads <n>` | Worker threads (default: all cores; `1` = single core) |
+| `--int8` | Int8 encoder projections on AVX-VNNI: about twice as fast, approximate (see [Int8](#int8-mode)) |
+| `--zero-pad` | Zero-pad the STFT like NeMo itself (default: reflection, like the ONNX export) |
+| `--words` / `--json` | Word timestamps / JSON output with token and word timestamps |
+| `bench --runs <n>` | `parakeet bench` times repeated transcriptions (set `PARAKEET_PROFILE=1` for a per-stage breakdown) |
+
+### Library
+
+```csharp
+using Parakeet;
+
+using var asr = await ParakeetAsr.LoadAsync();                  // v2; LoadAsync(ParakeetModel.TdtV3) for multilingual,
+                                                                // or ParakeetAsr.Load("/path/to/model.nemo")
+var result = asr.TranscribeFile("audio.wav");                   // any WAV: resampled to 16 kHz mono
+Console.WriteLine(result.Text);
+foreach (var w in result.Words) Console.WriteLine($"{w.Start:F2}-{w.End:F2} {w.Text}");
+Console.WriteLine($"RTF {result.RealTimeFactor:F3}");
+
+float[] samples = /* 16 kHz mono */;
+var r = asr.Transcribe(samples, onText: delta => Console.Write(delta));   // streams text as tokens are decoded
+```
+
+`ParakeetOptions` sets `Threads`, `Precision` (`Float32` / `Int8`), `PadMode`, `PositionCacheFrames` and `HugePages`.
+
+### Model download
+
+`ParakeetAsr.LoadAsync(ParakeetModel model, options, modelUrl, downloadToPath, reportProgress)` downloads the
+checkpoint once and loads it; `ParakeetAsr.DownloadModelAsync(model, downloadToPath, reportProgress)` only downloads.
+Files are cached in `~/.cache/parakeet` (or `$PARAKEET_CACHE`). The catalog in `ParakeetModels` (repository, file
+name, exact size, URL) points at the `.nemo` files on Hugging Face for now; `ParakeetModels.GetDownloadUrl` is the one
+place to switch to another host serving the same files, and `modelUrl` overrides it per call.
+
+The downloader (`IO/ModelDownloader.cs`, same design as the EmbeddingGemma2 one in sentence-transformers-sharp)
+streams to a `*.download` file and renames it only when complete and of the expected size, so a truncated file is
+never mistaken for a model. A dropped connection is retried with HTTP range requests, a `*.download` left by an
+interrupted process is resumed, and a cached file of the wrong size is fetched again. Downloads are single-flight
+across the process, progress is reported as `DownloadProgress` (~2 Hz), and `$HF_TOKEN` is sent to huggingface.co.
+One `ParakeetAsr` instance is thread-safe and can serve concurrent `Transcribe` calls. The stages are public as well:
+`MelSpectrogram` (features), `ConformerEncoder` (with a per-layer `TraceCallback`), `TdtDecoder` (with a per-step
+`StepCallback`), `NemoArchive` / `OnnxModelSource` (checkpoint readers), `WaveFile` / `Resampler`.
+
+## How it works
+
+```
+16 kHz audio ─► pre-emphasis ─► centered STFT (512, 25 ms Hann, 10 ms hop, double precision) ─► |X|² ─► Slaney mel (128)
+             ─► log(x + 2⁻²⁴) ─► per-feature normalization                                  [T, 128], 100 frames/s
+             ─► dw-striding subsampling ×8: Conv2d 3×3/2 ─► 2 × (depthwise 3×3/2 ─► pointwise) ─► Linear 4096→1024
+             ─► 24 × FastConformer block (d = 1024, 8 heads, FF 4096, conv kernel 9):              [T/8, 1024], 12.5 frames/s
+                  x += ½ FF(LN x);  x += RelPosMHA(LN x);  x += Conv(LN x);  x += ½ FF(LN x);  x = LN x
+             ─► TDT greedy decoding: 2-layer LSTM prediction network (640) over the last token,
+                joint = W_out · relu(W_enc · enc_t + W_pred · g) ─► argmax token (1024 or 8192 + blank)
+                                                                   and argmax duration (0-4 frames to skip)
+```
+
+| Source | Contents |
+|---|---|
+| `src/Parakeet/ParakeetAsr.cs` | Public API: load (with download), transcribe, timestamps |
+| `src/Parakeet/Audio/` | NeMo-compatible log-mel front end with a double-precision FFT, WAV reading, resampling |
+| `src/Parakeet/Model/` | Config, subsampling, conformer encoder, relative-position attention, TDT decoder |
+| `src/Parakeet/Numerics/` | GEMM (FP32 AVX-512, int8 AVX-VNNI), packed / quantized weights, worker pool, vector math, row ops |
+| `src/Parakeet/IO/` | `.nemo` reader (tar → zip → pickle, memory-mapped), ONNX protobuf reader, YAML, Hugging Face download |
+| `src/Parakeet/Text/` | SentencePiece vocabulary / detokenization |
+| `src/Parakeet.Cli/` | `parakeet` command-line tool |
+| `tests/Parakeet.Tests/` | Kernel unit tests, layer-by-layer parity, end-to-end, int8 accuracy |
+| `benchmarks/Parakeet.Benchmarks/` | In-process comparison with ONNX Runtime (the Go server's pipeline), GEMM micro-benchmarks |
+| `tools/Parakeet.TestAudio/` | Test-audio generator built on the [Voxwerk](https://github.com/curiosity-ai/voxwerk) NuGet packages |
+| `scripts/onnx_reference.py` | ONNX Runtime reference: dumps per-layer tensors, joint logits and transcripts |
+| `scripts/gen_kernels.py` | Generates the unrolled FP32 / int8 micro-kernels |
+| `testdata/audio/` | 29 generated test clips (+ `manifest.json` with their transcripts and languages) |
+
+### Performance design
+
+The encoder is ~15 GFLOP per second of audio, nearly all of it in GEMMs against 2.4 GB of FP32 weights that are
+each used once per forward pass, so the work is to keep the FMA units busy while the weights stream from DRAM.
+
+- **GEMM** (`Numerics/Gemm.cs`): weights are packed once at load into 32-column panels, stored k-block-major so a
+  thread sweeping its panels reads one contiguous stream; the next block is prefetched into L2 during the current
+  block's tile passes. A is packed once per call into 12-row micro-panels and a 12 × 32 tile of 24 zmm accumulators
+  sweeps each panel (generated kernels for 1–12 rows, so short inputs waste nothing). Bias, SiLU / ReLU and the
+  residual add are fused into the epilogue, and the macaron ½ is folded into the weights. ~150 GFLOP/s per core with
+  hot weights (≈ 87% of the measured FMA peak), on par with ONNX Runtime's MLAS with cold weights on 4 threads.
+- **Worker pool** (`Numerics/Parallelism.cs`): a forward pass has a few hundred parallel regions of a few ms each.
+  `Parallel.For` lost ~30% to wake-up latency and range-partitioning stragglers; dedicated workers that spin
+  briefly between jobs and claim items one at a time scale 2.4× → 3.4× on 4 cores.
+- **Attention** (`Model/RelPositionAttention.cs`): instead of materializing `(q + v)·Pᵀ` over all 2T-1 distances and
+  rel-shifting it (as NeMo and the ONNX graph do), each block of 64 query rows multiplies only the band of distances
+  it needs, then softmax and the value GEMM run while the block is cache-hot. Memory is O(T · 64).
+- **Positional projections** (`Model/ConformerEncoder.cs`): `PE · W_posᵀ` depends only on the length, and the rows a
+  shorter input needs are an exact slice of a longer input's table, so they are cached across calls (bounded).
+- **Subsampling** (`Model/Subsampling.cs`): the 2-D convolutions run in independent bands of output frames with
+  small per-thread buffers, so the full-resolution `[T/2, 64, 256]` feature maps never stream through memory.
+- **Decoder** (`Model/TdtDecoder.cs`): the encoder half of the joint is one GEMM over all frames; the embedding is
+  folded into the first LSTM layer's input projection (a lookup table); the prediction network runs only after a
+  non-blank token; per-step GEMVs run on the worker pool. 2.8× faster than ONNX Runtime's per-step decoder graph.
+- **Memory**: the checkpoint is memory-mapped and packed in parallel (loads in ~1.5 s from the page cache);
+  activation buffers are pooled across calls (allocating them per call cost a page fault + zeroing per page).
+
+### Int8 mode
+
+`ParakeetOptions.Precision = WeightPrecision.Int8` (CLI `--int8`) quantizes the encoder's large projections to int8
+per output channel and multiplies them on AVX-VNNI (`vpdpbusd`, 32 int8 multiply-adds per instruction, measured at
+2.2× the FP32 FMA rate per core) against activations quantized per row on the fly. Attention scores, normalization,
+the residual stream and the decoder stay FP32. Weights take a quarter of the memory. On the test set the v2
+transcripts are identical to FP32 (23/23, WER 1.31%) and v3 differs on 3 of 29 clips by a word or two (WER 2.09% vs
+1.96%). It falls back to FP32 on CPUs without AVX-VNNI. (.NET 10 exposes neither AVX-512 VNNI, AVX-512 BF16 nor AMX,
+so the int8 kernel uses 256-bit vectors.)
+
+## Validation
+
+`scripts/onnx_reference.py` runs the ONNX export (`nemo128.onnx` + `encoder-model.onnx` + `decoder_joint-model.onnx`)
+on ONNX Runtime exactly as the Go server did, exposes intermediate encoder tensors as extra graph outputs and saves
+them with the per-step joint logits and transcript. The xUnit parity tests feed each C# stage the reference's own
+input (ORT features into the encoder, ORT encoder output into the decoder), so errors are measured per stage:
+
+| Stage (v2, 10.8 s clip) | Relative L2 error vs ONNX Runtime |
+|---|---|
+| Slaney filterbank vs the checkpoint's | 5.6e-8 |
+| Log-mel features | 1.9e-6 |
+| Subsampling output | 6.6e-7 |
+| Relative positional encodings | 1.1e-7 |
+| Layer 0 internals (LN, FF1, q, positional projection, attention, GLU, conv, FF2) | 8e-7 – 2.0e-6 |
+| Conformer layers 0–23 | 1.6e-6 – 6.2e-6 |
+| Encoder output | 6.1e-6 (v3: 5.6e-6) |
+| Joint logits, all 67 decode steps | 1.9e-7 (v3: 2.3e-7) |
+| Encoder with weights read from the ONNX export instead of the `.nemo` | 2.6e-6 vs `.nemo` weights |
+
+End to end:
+
+| | Clips | Token-identical to ONNX Runtime | WER vs the spoken text |
+|---|---|---|---|
+| v2 (English) | 23 | **23 / 23** | 1.31% (687 words) |
+| v3 (en, de, fr, es, it, pt, ru) | 29 | **29 / 29** | 1.96% (762 words) |
+| v2, int8 mode | 23 | 23 / 23 | 1.31% |
+| v3, int8 mode | 29 | 26 / 29 | 2.09% |
+
+The remaining WER is the clips' own content (TTS pronunciations of invented names, "three thirty" written as "3.30"),
+identical in both implementations.
+
+### Test audio
+
+The clips in `testdata/audio` were generated with the [Voxwerk](https://github.com/curiosity-ai/voxwerk) NuGet packages
+(pure C# Qwen3-TTS) by `tools/Parakeet.TestAudio`:
+
+- `samples`: the reference recordings shipped in the `Voxwerk.Voices.English.*` packages (17 voices: US, British and
+  African accents, narration, characters, conversational styles), each with its exact transcript;
+- `synth`: sentences synthesized with `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, including numbers, a 37 s passage and
+  German, French, Spanish, Italian, Portuguese and Russian sentences for the multilingual model.
 
 ```bash
-# Download from GitHub releases
-curl -L -o onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.25.1/onnxruntime-linux-x64-1.25.1.tgz"
-tar xzf onnxruntime.tgz
-sudo cp onnxruntime-linux-x64-1.25.1/lib/* /usr/local/lib/
-sudo ldconfig
+dotnet run -c Release --project tools/Parakeet.TestAudio -- samples --out testdata/audio
+dotnet run -c Release --project tools/Parakeet.TestAudio -- synth --out testdata/audio
 ```
 
-#### Arch Linux
+### Running the tests
 
 ```bash
-# From AUR
-yay -S onnxruntime
+dotnet test -c Release        # kernel and downloader tests; model tests skip (and say so) without the environment below
+PARAKEET_NETWORK_TESTS=1 dotnet test -c Release --filter PublishedSizes   # checks the catalog against the download URLs
 
-# Or manually
-curl -L -o onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.25.1/onnxruntime-linux-x64-1.25.1.tgz"
-tar xzf onnxruntime.tgz
-sudo cp onnxruntime-linux-x64-1.25.1/lib/* /usr/local/lib/
-sudo ldconfig
+# Reference dumps from ONNX Runtime (Python: numpy onnx onnxruntime)
+python scripts/onnx_reference.py --models /path/to/parakeet-tdt-0.6b-v2-onnx --out /tmp/ref testdata/audio/*.wav
+
+PARAKEET_MODEL=/path/to/parakeet-tdt-0.6b-v2.nemo \
+PARAKEET_ONNX_DIR=/path/to/parakeet-tdt-0.6b-v2-onnx \
+PARAKEET_REFERENCE_DIR=/tmp/ref \
+dotnet test -c Release
 ```
 
-#### Alpine Linux
+The ONNX exports are [istupakov/parakeet-tdt-0.6b-v2-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx)
+and [-v3-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) (the fp32 files; the int8 ones are used only
+by the benchmark).
+
+## Performance
+
+Intel Xeon (Sapphire Rapids) cloud VM, 4 cores @ 2.1 GHz (AVX-512, AVX-VNNI), 16 GB; .NET 10.0.13; ONNX Runtime
+1.31.0 (Microsoft.ML.OnnxRuntime, CPU, `ORT_ENABLE_ALL`, intra-op threads = 4). The ONNX Runtime side is the Go
+server's pipeline run in-process (`benchmarks/Parakeet.Benchmarks/OnnxPipeline.cs`): `nemo128.onnx`, the encoder, and one
+`decoder_joint-model.onnx` run per decoding step with pre-allocated tensors. The two engines are run alternately on
+each clip and the medians of 5 runs (after a warm-up) are summed; the VM's timings vary by ±15% between runs, which
+the interleaving cancels for the comparison. Model v2, all 23 English clips (287 s of audio):
+
+**FP32, C# vs ONNX Runtime** (both exact; transcripts identical on 23 / 23 clips):
+
+| Total over 23 clips | Features | Encoder | Decoder | **Total** | RTF |
+|---|---|---|---|---|---|
+| ONNX Runtime (`encoder-model.onnx`) | 412 ms | 13 868 ms | 1 886 ms | 16 165 ms | 0.056 |
+| Parakeet C# | 252 ms | 12 354 ms | 677 ms | **13 283 ms** | **0.046** |
+| Speed-up | 1.64× | 1.12× | 2.78× | **1.22×** | |
+
+**Int8, C# vs ONNX Runtime's int8 export** (the Go server's recommended models):
+
+| Total over 23 clips | Features | Encoder | Decoder | **Total** | RTF |
+|---|---|---|---|---|---|
+| ONNX Runtime (`encoder-model.int8.onnx`) | 389 ms | 15 246 ms | 998 ms | 16 633 ms | 0.058 |
+| Parakeet C# (`--int8`) | 289 ms | 6 637 ms | 695 ms | **7 621 ms** | **0.027** |
+| Speed-up | 1.34× | 2.30× | 1.44× | **2.18×** | |
+
+The C# int8 transcripts equal the FP32 ones on all 23 clips; ONNX Runtime's int8 export differs from FP32 on 3
+(punctuation, a name, "three thirty" spelled out). ONNX Runtime's int8 encoder is no faster than its FP32 one on this
+CPU, so the C# int8 mode is also 2.2× faster than ONNX Runtime FP32 (encoder 2.3×).
+
+Per clip (median, total time):
+
+| Clip | Audio | ORT FP32 | C# FP32 | ORT int8 | C# int8 |
+|---|---|---|---|---|---|
+| synth-weather | 6.9 s | 422 ms | 330 ms | 470 ms | 199 ms |
+| sample-en-us-aaliyah-renwick | 10.8 s | 579 ms | 472 ms | 552 ms | 294 ms |
+| sample-en-gb-mei-lin-ashcombe | 15.2 s | 804 ms | 642 ms | 842 ms | 348 ms |
+| synth-long | 36.9 s | 1 956 ms | 1 557 ms | 2 256 ms | 909 ms |
+
+Single thread (`--threads 1`, 3 clips, 59 s of audio): C# FP32 7.27 s vs ONNX Runtime 8.30 s (**1.14×**; encoder 1.13×,
+decoder 1.37×).
+
+Loading from the page cache: **~1.5 s** for the C# engine (memory-mapped `.nemo`, layers packed in parallel) vs 4–9 s
+for ONNX Runtime session creation.
 
 ```bash
-apk add onnxruntime
+dotnet run -c Release --project benchmarks/Parakeet.Benchmarks -- \
+    --model parakeet-tdt-0.6b-v2.nemo --onnx parakeet-tdt-0.6b-v2-onnx --threads 4 --runs 5 testdata/audio/*.wav
+#   --cs-int8: C# int8 mode; --int8: ONNX Runtime runs the int8 export; --only csharp|onnx
+dotnet run -c Release --project benchmarks/Parakeet.Benchmarks -- --gemm --threads 4   # GEMM throughput
 ```
 
-#### Manual Installation (any distro)
+## Building
 
 ```bash
-# Download and extract
-curl -L -o onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.25.1/onnxruntime-linux-x64-1.25.1.tgz"
-tar xzf onnxruntime.tgz
-
-# Install to /usr/local
-sudo cp -r onnxruntime-linux-x64-1.25.1/lib/* /usr/local/lib/
-sudo cp -r onnxruntime-linux-x64-1.25.1/include/* /usr/local/include/
-sudo ldconfig
-
-# Or set environment variable to use from current directory
-export ONNXRUNTIME_LIB=$(pwd)/onnxruntime-linux-x64-1.25.1/lib/libonnxruntime.so
+dotnet build Parakeet.slnx -c Release
 ```
 
-#### ARM64 (Raspberry Pi, etc.)
-
-```bash
-curl -L -o onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.25.1/onnxruntime-linux-aarch64-1.25.1.tgz"
-tar xzf onnxruntime.tgz
-sudo cp onnxruntime-linux-aarch64-1.25.1/lib/* /usr/local/lib/
-sudo ldconfig
-```
-
-#### Verify Installation
-
-```bash
-# Check if library is found
-ldconfig -p | grep onnxruntime
-
-# Or find the library manually
-find /usr -name "libonnxruntime.so*" 2>/dev/null
-```
-
-If the library is installed in a non-standard location, set the `ONNXRUNTIME_LIB` environment variable:
-
-```bash
-export ONNXRUNTIME_LIB=/path/to/libonnxruntime.so
-```
-
-## Installation
-
-### From Release Binary
-
-Download the latest release for your platform from the [Releases](https://github.com/achetronic/parakeet/releases) page.
-
-```bash
-# Linux (amd64)
-curl -L -o parakeet https://github.com/achetronic/parakeet/releases/latest/download/parakeet-linux-amd64
-chmod +x parakeet
-
-# Download models (using Makefile)
-make models           # int8 quantized models (recommended, ~670MB)
-# Or for full precision:
-make models-fp32      # fp32 models (~2.5GB)
-
-# Run (requires ONNX Runtime - see Installing ONNX Runtime section above)
-./parakeet -port 5092 -models ./models
-```
-
-### From Source
-
-```bash
-# Clone the repository
-git clone https://github.com/achetronic/parakeet.git
-cd parakeet
-
-# Download models
-make models           # int8 quantized models (recommended)
-# Or: make models-fp32  # full precision models
-
-# Build
-make build
-
-# Run
-./bin/parakeet
-```
-
-### Using Docker
-
-The Docker image that is published in the repository is ready to use. It includes ONNX Runtime and models.
-
-```bash
-
-# Run the container
-docker run -d \
-  --name parakeet \
-  -p 5092:5092 \
-  ghcr.io/achetronic/parakeet:latest
-```
-
-#### Docker Compose
-
-```yaml
-version: "3.8"
-services:
-  parakeet:
-    image: ghcr.io/achetronic/parakeet:latest
-    ports:
-      - "5092:5092"
-    environment:
-      - PARAKEET_API_KEY=your-secret-key # optional
-      - PARAKEET_WORKERS=2
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5092/health"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-```
-
-### GPU Inference (CUDA)
-
-Parakeet can offload inference to an NVIDIA GPU through the ONNX Runtime CUDA
-execution provider. GPU support ships as a dedicated image with the `-cuda`
-tag suffix; it bundles the GPU build of ONNX Runtime and the fp32 models on a
-CUDA base image.
-
-**Prerequisites:** an NVIDIA GPU with up-to-date drivers and the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-installed on the host. The CUDA image is `linux/amd64` only.
-
-```bash
-docker run -d \
-  --name parakeet \
-  --gpus all \
-  -p 5092:5092 \
-  ghcr.io/achetronic/parakeet:latest-cuda
-```
-
-The CUDA image enables the GPU by default (`-gpu cuda`). For a non-Docker
-binary, or to select a specific device, use the `-gpu`/`-gpu-device` flags or
-the `PARAKEET_GPU`/`PARAKEET_GPU_DEVICE` environment variables:
-
-```bash
-./parakeet -gpu cuda -gpu-device 0
-# or, equivalently, via environment:
-PARAKEET_GPU=cuda PARAKEET_GPU_DEVICE=0 ./parakeet
-```
-
-If the requested provider cannot be initialized (missing CUDA libraries, driver
-or version mismatch), the server fails at startup rather than silently falling
-back to CPU, so misconfiguration is visible immediately.
-
-> [!NOTE]
-> fp32 is the GPU-appropriate precision and is the default for the CUDA image.
-> CPU images and CPU mode are unaffected by these flags.
-
-**Memory and audio length.** The encoder processes the whole file in a single
-pass, so peak memory scales with audio duration. On GPU this is bounded by VRAM:
-very long inputs (roughly an hour or more on a 24 GB card) can exceed device
-memory and fail with an ONNX Runtime allocation error. Segment long audio (for
-example with `ffmpeg -i in.wav -f segment -segment_time 300 -ar 16000 -ac 1
-chunk_%03d.wav`) or use a CPU image, which is bounded by system RAM instead.
-
-## Configuration
-
-### Command Line Flags
-
-| Flag                          | Description                                                              | Default                    | Example                                |
-| ----------------------------- | ------------------------------------------------------------------------ | -------------------------- | -------------------------------------- |
-| `-port`                       | HTTP server port                                                         | `5092`                     | `-port 8080`                           |
-| `-models`                     | Path to models directory                                                 | `./models`                 | `-models /opt/parakeet/models`         |
-| `-log-level`                  | Log level: debug, info, warn, error                                      | `info`                     | `-log-level debug`                     |
-| `-log-format`                 | Log output format: text or json                                          | `text`                     | `-log-format json`                     |
-| `-workers`                    | Concurrent inference workers (each ~670MB RAM for int8)                  | `4`                        | `-workers 2`                           |
-| `-ffmpeg`                     | Enable ffmpeg fallback for non-WAV audio                                 | `true`                     | `-ffmpeg=false`                        |
-| `-ffmpeg-path`                | Path to the ffmpeg binary (empty = resolve from `PATH`)                  | ``                         | `-ffmpeg-path /usr/bin/ffmpeg`         |
-| `-ffmpeg-timeout`             | Maximum wall-clock time for a single ffmpeg conversion                   | `60s`                      | `-ffmpeg-timeout 30s`                  |
-| `-gpu`                        | Execution provider: `cpu` or `cuda`                                      | `cpu`                      | `-gpu cuda`                            |
-| `-gpu-device`                 | GPU device index for `cuda`                                              | `0`                        | `-gpu-device 1`                        |
-| `-long-audio`                 | Split audio over the model limit into chunks instead of rejecting it     | `false`                    | `-long-audio`                          |
-| `-chunk-seconds`              | Sliding-window size for long audio, in seconds                           | `300`                      | `-chunk-seconds 240`                   |
-| `-chunk-overlap-seconds`      | Overlap between consecutive chunks, in seconds                           | `15`                       | `-chunk-overlap-seconds 10`            |
-| `-disable-vad-based-chunking` | Disable the Silero VAD chunk-boundary layer (falls back to mel energy)   | `false`                    | `-disable-vad-based-chunking`          |
-| `-disable-mel-based-chunking` | Disable the mel-energy chunk-boundary layer (falls back to the midpoint) | `false`                    | `-disable-mel-based-chunking`          |
-| `-vad-model-path`             | Path to the Silero VAD ONNX model                                        | `<models>/silero_vad.onnx` | `-vad-model-path /opt/silero_vad.onnx` |
-
-**Examples:**
-
-```bash
-# Basic usage
-./parakeet
-
-# Custom port and models directory
-./parakeet -port 8080 -models /opt/models
-
-# Enable debug logging for troubleshooting
-./parakeet -log-level debug
-
-# JSON logs for production (e.g. log aggregation with ELK, Loki, CloudWatch)
-./parakeet -log-format json
-
-# JSON logs with debug level
-./parakeet -log-format json -log-level debug
-
-# Suppress ONNX Runtime schema warnings (stderr) while keeping debug logs
-./parakeet -log-level debug 2>&1 | grep -v "Schema error"
-```
-
-### Long Audio
-
-The model's encoder tops out at 400 seconds of audio in a single pass. By
-default, longer input is rejected with a clear error (and a log line pointing
-here). Pass `-long-audio` to split it into overlapping windows
-(`-chunk-seconds`, `-chunk-overlap-seconds`), transcribe each, and stitch the
-results, dropping the overlap so words at the seams are not duplicated. Files
-under the chunk size are transcribed in one pass either way.
-
-**How chunk boundaries are chosen.** A blind split in the middle of an overlap
-can fall mid-word and make that word show up twice or vanish at the seam. To
-avoid this, the overlap is split on silence using a cascade (each layer falls
-through to the next when it cannot decide):
-
-1. **Silero VAD** picks the centre of the longest silence in the overlap. This
-   needs `silero_vad.onnx` in the models directory (downloaded by `make models`;
-   see below). A missing model is not fatal: it warns once and falls back to the
-   next layer.
-2. **Mel energy** picks the quietest point of the already-extracted features.
-3. **Midpoint** is the final fallback (the original behaviour).
-
-A second, always-on safety net removes any duplicate or colliding tokens right
-at each seam. You can turn off individual layers with
-`-disable-vad-based-chunking` / `-disable-mel-based-chunking`.
-
-### Environment Variables
-
-Every command-line flag also reads from an environment variable: take the flag
-name, uppercase it and replace dashes with underscores, then prefix it with
-`PARAKEET_`. So `-log-level` maps to `PARAKEET_LOG_LEVEL`, `-ffmpeg-timeout` to
-`PARAKEET_FFMPEG_TIMEOUT`, and so on. An explicit flag always overrides its env
-var (precedence: **CLI flag > env var > default**); an invalid env value is
-ignored with a warning and the default is kept.
-
-The Docker images bake their operational defaults as `PARAKEET_*` env vars, so
-they survive when you pass your own flags.
-
-A few variables have no flag equivalent:
-
-| Variable           | Description                                 | Default               |
-| ------------------ | ------------------------------------------- | --------------------- |
-| `ONNXRUNTIME_LIB`  | Path to libonnxruntime.so                   | Auto-detected         |
-| `PARAKEET_API_KEY` | API key for `/v1/*` endpoint authentication | Empty (auth disabled) |
-
-### Model Files
-
-The following files are required in the models directory:
-
-| File                            | Size   | Description                                              |
-| ------------------------------- | ------ | -------------------------------------------------------- |
-| `config.json`                   | 97 B   | Model configuration                                      |
-| `vocab.txt`                     | 94 KB  | SentencePiece vocabulary                                 |
-| `nemo128.onnx`                  | 140 KB | Preprocessor graph                                       |
-| `encoder-model.int8.onnx`       | 652 MB | Quantized encoder                                        |
-| `decoder_joint-model.int8.onnx` | 18 MB  | Quantized TDT decoder                                    |
-| `silero_vad.onnx`               | 2.3 MB | Silero VAD (chunk boundaries, long-audio only; optional) |
-
-For full precision models, use `encoder-model.onnx` (requires `encoder-model.onnx.data`, 2.5GB total) and `decoder_joint-model.onnx` (72MB).
-
-`silero_vad.onnx` ([snakers4/silero-vad](https://github.com/snakers4/silero-vad), MIT, pinned to release v6.2.1) is downloaded and checksum-verified by `make models`. It is only used to place chunk boundaries on silence in long-audio mode; if it is missing the server logs a warning once and falls back to mel-energy boundaries.
-
-## API Reference
-
-### Authentication
-
-When `PARAKEET_API_KEY` is set, all `/v1/*` endpoints require an `Authorization` header:
-
-```bash
-curl -H "Authorization: Bearer YOUR_API_KEY" http://localhost:5092/v1/models
-```
-
-The `/health` endpoint is always unauthenticated.
-
-### Transcribe Audio
-
-```
-POST /v1/audio/transcriptions
-```
-
-Transcribes audio into text. Compatible with OpenAI's Whisper API.
-
-**Request**
-
-Content-Type: `multipart/form-data`
-
-| Parameter         | Type   | Required | Description                                                                            |
-| ----------------- | ------ | -------- | -------------------------------------------------------------------------------------- |
-| `file`            | file   | Yes      | Audio file (WAV always supported; MP3/OGG/WebM/FLAC/M4A/AAC/Opus via ffmpeg, max 25MB) |
-| `model`           | string | No       | Model name (accepted but ignored)                                                      |
-| `language`        | string | No       | ISO-639-1 language code (default: en)                                                  |
-| `response_format` | string | No       | Output format: json, text, srt, vtt, verbose_json                                      |
-| `stream`          | bool   | No       | When `true`, stream the transcription as Server-Sent Events (see Streaming below)      |
-| `prompt`          | string | No       | Accepted but ignored                                                                   |
-| `temperature`     | float  | No       | Accepted but ignored                                                                   |
-
-**Response**
-
-JSON format (default):
-
-```json
-{
-  "text": "transcribed text here"
-}
-```
-
-Verbose JSON format:
-
-```json
-{
-  "task": "transcribe",
-  "language": "en",
-  "duration": 5.2,
-  "text": "transcribed text here",
-  "segments": [
-    {
-      "id": 0,
-      "start": 0,
-      "end": 5.2,
-      "text": "transcribed text here"
-    }
-  ]
-}
-```
-
-**Example**
-
-```bash
-curl -X POST http://localhost:5092/v1/audio/transcriptions \
-  -H "Authorization: Bearer $PARAKEET_API_KEY" \
-  -F file=@audio.wav \
-  -F language=en \
-  -F response_format=json
-```
-
-#### Streaming
-
-Set `stream=true` to receive the transcription incrementally as
-[Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events),
-following OpenAI's streaming transcription protocol. The audio is still
-uploaded in full; the server emits each chunk of text as soon as it is
-decoded, then a final event with the complete text.
-
-Two event types are sent:
-
-- `transcript.text.delta` — a piece of newly transcribed text.
-- `transcript.text.done` — sent once at the end, with the full transcript.
-
-**Example**
-
-```bash
-curl -N -X POST http://localhost:5092/v1/audio/transcriptions \
-  -H "Authorization: Bearer $PARAKEET_API_KEY" \
-  -F file=@audio.wav \
-  -F stream=true
-```
-
-**Response** (`Content-Type: text/event-stream`):
-
-```
-event: transcript.text.delta
-data: {"type":"transcript.text.delta","delta":" Ma"}
-
-event: transcript.text.delta
-data: {"type":"transcript.text.delta","delta":"ybe"}
-
-event: transcript.text.done
-data: {"type":"transcript.text.done","text":"Maybe next time, huh?"}
-```
-
-This is compatible with clients that speak OpenAI's streaming
-transcription API, such as Wyoming OpenAI for Home Assistant.
-
-### List Models
-
-```
-GET /v1/models
-```
-
-Returns available models. Returns `parakeet-tdt-0.6b` and `whisper-1` (alias for compatibility).
-
-### Health Check
-
-```
-GET /health
-```
-
-Returns `{"status": "ok"}` if the server is running.
-
-## Development
-
-### Available Make Targets
-
-```bash
-make help          # Show all available targets
-
-# Build
-make build         # Build the binary
-
-# Development
-make run           # Build and run
-make run-dev       # Run with custom port (5092) for development
-make clean         # Remove build artifacts
-
-# Code quality
-make fmt           # Format code
-make vet           # Run go vet
-make lint          # Run all linters (vet + fmt)
-make test          # Run tests
-make test-coverage # Run tests with coverage report
-
-# Models
-make models        # Download int8 models (default)
-make models-int8   # Download int8 quantized models
-make models-fp32   # Download full precision models
-
-# Docker
-make docker-build-int8  # Build Docker image with int8 models
-make docker-build-fp32  # Build Docker image with fp32 models
-make docker-build-cuda  # Build CUDA/GPU image with fp32 models
-make docker-run-int8    # Run Docker container with int8 models
-make docker-run-fp32    # Run Docker container with fp32 models
-make docker-run-cuda    # Run CUDA/GPU container (needs --gpus all)
-
-# Release
-make release       # Build binaries for all platforms
-```
-
-### Running Tests
-
-```bash
-make test
-
-# With coverage
-make test-coverage
-open coverage.html
-```
-
-## Troubleshooting
-
-### ONNX Runtime library not found
-
-Install ONNX Runtime or set the library path:
-
-```bash
-export ONNXRUNTIME_LIB=/path/to/libonnxruntime.so
-```
-
-Common installation locations:
-
-- `/usr/lib/libonnxruntime.so`
-- `/usr/local/lib/libonnxruntime.so`
-- `/opt/onnxruntime/lib/libonnxruntime.so`
-
-### Encoder model not found
-
-Download the models:
-
-```bash
-make models
-```
-
-### Out of memory errors
-
-Use the int8 quantized models (default) instead of fp32. The int8 models require approximately 2GB of RAM versus 6GB for fp32.
-
-### Unsupported audio format
-
-WAV is always supported natively. Any other format (MP3, OGG, WebM, FLAC, M4A, AAC, Opus, ...) is transcoded on the fly to 16 kHz mono WAV using a local `ffmpeg` binary.
-
-If the server responds with `400 Unsupported or malformed audio`:
-
-1. Install `ffmpeg` and make sure it is in `PATH` (or pass `-ffmpeg-path /absolute/path/to/ffmpeg`). The official Docker image already includes ffmpeg.
-2. Check the server logs. On startup you will see one of:
-   - `ffmpeg conversion enabled binary=/usr/bin/ffmpeg timeout=60s` — ready.
-   - `ffmpeg not found, non-WAV inputs will be rejected` — install it or disable conversion with `-ffmpeg=false` if you only need WAV.
-3. As a manual alternative, convert client-side before uploading:
-
-   ```bash
-   ffmpeg -i input.mp3 -ar 16000 -ac 1 output.wav
-   ```
-
-Audio is detected by content (magic bytes), not by filename extension, so clients that upload files without an extension still work.
+Requires the .NET 10 SDK. AVX-512 (or AVX2 + FMA) is used when available, with portable fallbacks; the int8 mode
+needs AVX-VNNI.
 
 ## License
 
-- Code: MIT License
-- Parakeet Model: [CC-BY-4.0](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
-
-## Credits
-
-- **NVIDIA** - Original [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) model
-- **Ivan Stupakov** ([@istupakov](https://github.com/istupakov)) - [ONNX conversion](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) of the Parakeet model
+Apache-2.0 (see [LICENSE](LICENSE)), like the original server. The low-level numerics (native buffers, worker pool
+pattern, packed-panel GEMM structure) are adapted from [Voxwerk](https://github.com/curiosity-ai/voxwerk) (MIT, see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)). The Parakeet models are released by NVIDIA under
+[CC-BY-4.0](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) and are downloaded separately.
