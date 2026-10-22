@@ -49,6 +49,21 @@ public sealed class EndToEndTests(ModelFixture model, ITestOutputHelper output)
     }
 
     [Fact]
+    public void PositionCacheSlicesAreExact()
+    {
+        if (!Fixtures.Available(output)) return;
+        var asr = model.Asr!;
+        var shortAudio = WaveFile.ReadMono(Path.Combine(Fixtures.AudioDir, "synth-weather.wav"));
+        var longAudio = WaveFile.ReadMono(Path.Combine(Fixtures.AudioDir, "synth-long.wav"));
+        var f = asr.Frontend.Compute(shortAudio);
+        int frames = asr.Frontend.FrameCount(shortAudio.Length);
+        var before = asr.Encoder.Forward(f, frames, asr.Parallelism);
+        asr.Transcribe(longAudio);                       // grows the cached table past the short input's length
+        var after = asr.Encoder.Forward(f, frames, asr.Parallelism);
+        Assert.Equal(before, after);
+    }
+
+    [Fact]
     public void SilenceAndShortInputProduceNoText()
     {
         if (!Fixtures.Available(output)) return;

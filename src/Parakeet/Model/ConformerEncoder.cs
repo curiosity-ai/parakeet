@@ -109,9 +109,10 @@ public sealed unsafe class ConformerEncoder : IDisposable
     private readonly Subsampling _sub;
     private readonly ConformerLayer[] _layers;
 
-    internal ConformerEncoder(WeightReader w, ParakeetConfig cfg)
+    internal ConformerEncoder(WeightReader w, ParakeetConfig cfg, int positionCacheFrames = 0)
     {
         _cfg = cfg;
+        _positionCacheFrames = positionCacheFrames;
         _sub = new Subsampling(w, cfg);
         _layers = new ConformerLayer[cfg.Layers];
         try
@@ -168,11 +169,16 @@ public sealed unsafe class ConformerEncoder : IDisposable
             for (long i = 0; i < (long)t * d; i++) x[i] *= xs;
         }
         trace?.Invoke("pre_encode", x, t, d);
-        RelPositionAttention.PositionalEncoding(t, d, ws.PosEmb.Ptr);
+        // Relative positional encodings and their per-layer projections depend only on T: take them from the cache
+        // when it covers T (a slice of the table built for the longest input so far), else compute them here.
+        var table = Positions(t, par);
+        long posOff = table == null ? 0 : (long)(table.Frames - t) * d;
+        float* pe = table == null ? ws.PosEmb.Ptr : table.Pe.Ptr + posOff;
+        if (table == null) RelPositionAttention.PositionalEncoding(t, d, pe);
         Profiler.Mark("pos_enc");
-        trace?.Invoke("pos_emb", ws.PosEmb.Ptr, 2 * t - 1, d);
+        trace?.Invoke("pos_emb", pe, 2 * t - 1, d);
 
-        float* h = ws.Norm.Ptr, big = ws.Big.Ptr, ctx = ws.Ctx.Ptr, pp = ws.P.Ptr;
+        float* h = ws.Norm.Ptr, big = ws.Big.Ptr, ctx = ws.Ctx.Ptr;
         for (int li = 0; li < _layers.Length; li++)
         {
             var L = _layers[li];
@@ -193,7 +199,9 @@ public sealed unsafe class ConformerEncoder : IDisposable
             Profiler.Mark("layernorm");
             Gemm.Multiply(h, d, t, L.Qkv, big, 3 * d, par, Ptr(L.QkvB));
             Profiler.Mark("qkv gemm");
-            Gemm.Multiply(ws.PosEmb.Ptr, d, 2 * t - 1, L.Pos, pp, d, par);
+            float* pp = ws.P.Ptr;
+            if (table == null) Gemm.Multiply(pe, d, 2 * t - 1, L.Pos, pp, d, par);
+            else pp = table.P[li].Ptr + posOff;
             Profiler.Mark("pos gemm");
             if (tr0)
             {
@@ -236,6 +244,51 @@ public sealed unsafe class ConformerEncoder : IDisposable
             Profiler.Mark("layernorm");
             trace?.Invoke($"layer{li}", x, t, d);
         }
+        GC.KeepAlive(table);
+    }
+
+    /// <summary>Encodings <c>[2F-1, d]</c> and per-layer projections <c>PE · W_posᵀ</c> for up to F frames. A T-frame input
+    /// uses rows [F - T, F + T - 1): row k holds distance F-1-k, and every row is computed independently, so the slice is
+    /// exactly what a T-frame computation would produce.</summary>
+    private sealed class PositionTable
+    {
+        public required int Frames { get; init; }
+        public required NativeBuffer<float> Pe { get; init; }
+        public required NativeBuffer<float>[] P { get; init; }
+    }
+
+    private readonly int _positionCacheFrames;
+    private readonly object _positionLock = new();
+    private volatile PositionTable? _positions;
+
+    /// <summary>Bytes held by the positional-projection cache.</summary>
+    internal long PositionCacheBytes => _positions is { } p ? (p.P.Length + 1) * p.Pe.Length * 4 : 0;
+
+    private PositionTable? Positions(int t, Parallelism par)
+    {
+        var table = _positions;
+        if (table != null && table.Frames >= t) return table;
+        if (t > _positionCacheFrames) return null;
+        lock (_positionLock)
+        {
+            table = _positions;
+            if (table != null && table.Frames >= t) return table;
+            // Grow geometrically (rounded to 64 frames) so a sequence of longer inputs rebuilds only a few times.
+            int frames = Math.Min(_positionCacheFrames, Math.Max((t + 63) / 64 * 64, 2 * (table?.Frames ?? 0)));
+            int d = _cfg.DModel;
+            long rows = 2L * frames - 1;
+            var pe = new NativeBuffer<float>(rows * d, zero: false);
+            RelPositionAttention.PositionalEncoding(frames, d, pe.Ptr);
+            var p = new NativeBuffer<float>[_layers.Length];
+            for (int li = 0; li < _layers.Length; li++)
+            {
+                p[li] = new NativeBuffer<float>(rows * d, zero: false);
+                Gemm.Multiply(pe.Ptr, d, (int)rows, _layers[li].Pos, p[li].Ptr, d, par);
+            }
+            // The previous table is released by its finalizers once no running forward pass references it.
+            _positions = table = new PositionTable { Frames = frames, Pe = pe, P = p };
+            return table;
+        }
     }
 
     private static float* Ptr(NativeBuffer<float>? b) => b == null ? null : b.Ptr;
@@ -270,6 +323,12 @@ public sealed unsafe class ConformerEncoder : IDisposable
     public void Dispose()
     {
         TrimWorkspaces();
+        if (_positions is { } pt)
+        {
+            pt.Pe.Dispose();
+            foreach (var b in pt.P) b.Dispose();
+            _positions = null;
+        }
         _sub?.Dispose();
         if (_layers != null)
             foreach (var l in _layers) l?.Dispose();

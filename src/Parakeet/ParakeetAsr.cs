@@ -19,6 +19,12 @@ public sealed record ParakeetOptions
     /// <summary>Back the 2.4 GB of packed weights with transparent huge pages (Linux). Off by default: the kernel may
     /// have to compact memory to provide them, which can add seconds to loading on a machine with a busy page cache.</summary>
     public bool HugePages { get; init; }
+
+    /// <summary>Longest input (in 80 ms encoder frames) whose relative positional projections are cached across calls.
+    /// They depend only on the input length, so caching them removes ~7% of the encoder's work for every input up to
+    /// this length, at <c>~200 KB × frames</c> of memory (default 512 frames ≈ 41 s of audio, ≈ 100 MB at most).
+    /// 0 disables the cache.</summary>
+    public int PositionCacheFrames { get; init; } = 512;
 }
 
 /// <summary>A decoded token with its time span.</summary>
@@ -56,7 +62,7 @@ public sealed class ParakeetAsr : IDisposable
         if (source.Contains("preprocessor.featurizer.fb")) fb = source.Get("preprocessor.featurizer.fb").ToArray();
         if (source.Contains("preprocessor.featurizer.window")) window = source.Get("preprocessor.featurizer.window").ToArray();
         Frontend = new MelSpectrogram(Config.Mel, fb, window);
-        Encoder = new ConformerEncoder(w, Config);
+        Encoder = new ConformerEncoder(w, Config, options.PositionCacheFrames);
         try
         {
             Decoder = new TdtDecoder(w, Config);
