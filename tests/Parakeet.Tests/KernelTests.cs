@@ -44,7 +44,8 @@ public sealed unsafe class KernelTests(ITestOutputHelper output)
                 fixed (float* wp = w, ap = a, cp = c, bp = bias)
                 {
                     using var packed = PackedMatrix.FromLinear(wp, n, k);
-                    Gemm.Multiply(ap, k, m, packed, cp, n, new Parallelism(threads), useBias ? bp : null, acc, act);
+                    using var par = new Parallelism(threads);
+                    Gemm.Multiply(ap, k, m, packed, cp, n, par, useBias ? bp : null, acc, act);
                 }
                 double maxErr = 0;
                 for (int i = 0; i < m; i++)
@@ -83,6 +84,32 @@ public sealed unsafe class KernelTests(ITestOutputHelper output)
                 for (int p = 0; p < k; p++) s += (double)a[i * k + p] * w[col * k + p];
                 Assert.True(Math.Abs(s - c[i * cols + j]) < 1e-4, $"({i}, {col})");
             }
+    }
+
+    [Fact]
+    public void WorkerPoolRunsEveryItemUnderStress()
+    {
+        // Jobs separated by gaps shorter and longer than the workers' spin window exercise the spin, sleep and wake
+        // paths; a second caller thread exercises the concurrent-use fallback.
+        using var par = new Parallelism(4);
+        var task = Task.Run(() => Hammer(par, 7));
+        Hammer(par, 3);
+        Assert.True(task.Wait(TimeSpan.FromMinutes(2)), "worker pool hung");
+
+        static void Hammer(Parallelism par, int seed)
+        {
+            var rnd = new Random(seed);
+            for (int job = 0; job < 1500; job++)
+            {
+                int count = rnd.Next(1, 40);
+                var hits = new int[count];
+                par.For(count, i => Interlocked.Increment(ref hits[i]));
+                Assert.All(hits, h => Assert.Equal(1, h));
+                int gap = rnd.Next(0, 4);
+                if (gap == 1) Thread.SpinWait(rnd.Next(10, 2000));
+                else if (gap == 2) Thread.Sleep(rnd.Next(0, 2));
+            }
+        }
     }
 
     [Fact]

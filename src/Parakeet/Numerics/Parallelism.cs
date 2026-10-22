@@ -66,10 +66,10 @@ public sealed class Parallelism : IDisposable
 /// </summary>
 internal sealed class WorkerPool : IDisposable
 {
-    private const int SpinIterations = 20000;   // ≈ 50-100 µs of spinning before a worker blocks
+    private static readonly long SpinTicks = System.Diagnostics.Stopwatch.Frequency / 10000;   // spin ≈ 100 µs before blocking
 
     private readonly Thread[] _threads;
-    private readonly SemaphoreSlim _wake = new(0);
+    private readonly object _sleep = new();
     private readonly object _gate = new();
     private Action<int>? _body;
     private int _count;
@@ -105,8 +105,10 @@ internal sealed class WorkerPool : IDisposable
             Volatile.Write(ref _next, 0);
             Volatile.Write(ref _pending, _threads.Length);
             Interlocked.Increment(ref _generation);
-            int sleepers = Volatile.Read(ref _sleepers);
-            if (sleepers > 0) _wake.Release(sleepers);
+            // Sleeping workers re-check the generation under the lock, so a pulse can never be lost (a semaphore
+            // permit could be taken by a worker that already finished this job, leaving another one asleep).
+            if (Volatile.Read(ref _sleepers) > 0)
+                lock (_sleep) Monitor.PulseAll(_sleep);
 
             t_inPool = true;
             try
@@ -154,18 +156,19 @@ internal sealed class WorkerPool : IDisposable
             long gen = Volatile.Read(ref _generation);
             if (gen == seen)
             {
-                int spins = 0;
-                while ((gen = Volatile.Read(ref _generation)) == seen && !_disposed)
+                // Spin briefly (back-to-back GEMMs arrive within microseconds), then block until the next job.
+                long start = System.Diagnostics.Stopwatch.GetTimestamp();
+                while ((gen = Volatile.Read(ref _generation)) == seen && !_disposed &&
+                       System.Diagnostics.Stopwatch.GetTimestamp() - start < SpinTicks)
+                    Thread.SpinWait(1);
+                if (gen == seen && !_disposed)
                 {
-                    if (++spins < SpinIterations)
+                    lock (_sleep)
                     {
-                        Thread.SpinWait(8);
-                        continue;
+                        Interlocked.Increment(ref _sleepers);
+                        while ((gen = Volatile.Read(ref _generation)) == seen && !_disposed) Monitor.Wait(_sleep);
+                        Interlocked.Decrement(ref _sleepers);
                     }
-                    Interlocked.Increment(ref _sleepers);
-                    if ((gen = Volatile.Read(ref _generation)) == seen && !_disposed) _wake.Wait(10);
-                    Interlocked.Decrement(ref _sleepers);
-                    spins = 0;
                 }
                 if (_disposed) return;
             }
@@ -179,6 +182,6 @@ internal sealed class WorkerPool : IDisposable
     public void Dispose()
     {
         _disposed = true;
-        _wake.Release(_threads.Length);
+        lock (_sleep) Monitor.PulseAll(_sleep);
     }
 }
