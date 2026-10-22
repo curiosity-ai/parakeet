@@ -121,20 +121,6 @@ public sealed unsafe class PackedMatrix : IDisposable
         }
     }
 
-    /// <summary>Concatenates linear weights <c>W_i[n_i, k]</c> along the output dimension (e.g. fused q/k/v).</summary>
-    public static PackedMatrix FromLinears(int k, bool hugePages, params (IntPtr Ptr, int Rows)[] parts)
-    {
-        int n = parts.Sum(p => p.Rows);
-        using var tmp = new NativeBuffer<float>((long)n * k, zero: false);
-        long off = 0;
-        foreach (var (ptr, rows) in parts)
-        {
-            Buffer.MemoryCopy((void*)ptr, tmp.Ptr + off, (long)rows * k * sizeof(float), (long)rows * k * sizeof(float));
-            off += (long)rows * k;
-        }
-        return FromLinear(tmp.Ptr, n, k, hugePages: hugePages);
-    }
-
     /// <summary>Unpacks back to a row-major <c>B[K, N]</c> (tests).</summary>
     public float[] ToKN()
     {

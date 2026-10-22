@@ -67,21 +67,6 @@ internal sealed unsafe class WeightReader(ITensorSource src, bool hugePages = fa
         return LinearWeight.FromLinear(tmp.Ptr, n, inDim, 1f, precision, hugePages);
     }
 
-    /// <summary>Packs several linear weights stacked along the output dimension (fused projections).</summary>
-    public PackedMatrix FusedLinear(int inDim, params (string Name, int Out)[] parts)
-    {
-        int n = parts.Sum(p => p.Out);
-        using var tmp = new NativeBuffer<float>((long)n * inDim, zero: false);
-        long off = 0;
-        foreach (var (name, outDim) in parts)
-        {
-            var span = Get(name, outDim, inDim).Span;
-            span.CopyTo(new Span<float>(tmp.Ptr + off, span.Length));
-            off += span.Length;
-        }
-        return PackedMatrix.FromLinear(tmp.Ptr, n, inDim, hugePages: hugePages);
-    }
-
     /// <summary>Concatenates optional biases of fused projections (zeros where absent); null when none exist.</summary>
     public NativeBuffer<float>? FusedBias(params (string Name, int Out)[] parts)
     {

@@ -131,10 +131,6 @@ public sealed unsafe class ConformerEncoder : IDisposable
 
     public ParakeetConfig Config => _cfg;
 
-    /// <summary>Total packed weight bytes.</summary>
-    internal long WeightBytes => _layers.Sum(l => l.Ff1W1.ByteSize + l.Ff1W2.ByteSize + l.Ff2W1.ByteSize + l.Ff2W2.ByteSize +
-                                                  l.Qkv.ByteSize + l.Pos.ByteSize + l.Out.ByteSize + l.Pw1.ByteSize + l.Pw2.ByteSize);
-
     /// <summary>Encodes <c>[melFrames, features]</c> features into <c>[EncoderFrames(melFrames), d_model]</c>.</summary>
     public float[] Forward(ReadOnlySpan<float> features, int melFrames, Parallelism par, TraceCallback? trace = null)
     {
@@ -261,9 +257,6 @@ public sealed unsafe class ConformerEncoder : IDisposable
     private readonly int _positionCacheFrames;
     private readonly object _positionLock = new();
     private volatile PositionTable? _positions;
-
-    /// <summary>Bytes held by the positional-projection cache.</summary>
-    internal long PositionCacheBytes => _positions is { } p ? (p.P.Length + 1) * p.Pe.Length * 4 : 0;
 
     private PositionTable? Positions(int t, Parallelism par)
     {
