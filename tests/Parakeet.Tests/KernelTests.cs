@@ -63,6 +63,62 @@ public sealed unsafe class KernelTests(ITestOutputHelper output)
             }
     }
 
+    [Theory]
+    [InlineData(1, 32, 4)]
+    [InlineData(5, 64, 1024)]
+    [InlineData(6, 32, 8)]
+    [InlineData(13, 96, 256)]
+    [InlineData(87, 1024, 4096)]
+    public void Int8GemmMatchesDequantizedReference(int m, int n, int k)
+    {
+        if (!Int8Gemm.IsSupported) return;
+        foreach (var mode in new[] { "plain", "bias-acc", "silu" })
+        {
+            var a = Random(m * k, 21, 2f);
+            var w = Random(n * k, 22, 0.1f);
+            var bias = Random(n, 23);
+            var c0 = Random(m * n, 24);
+            var c = (float[])c0.Clone();
+            bool useBias = mode.Contains("bias"), acc = mode.Contains("acc");
+            var act = mode == "silu" ? Activation.Silu : Activation.None;
+            float[] bq;
+            fixed (float* wp = w, ap = a, cp = c, bp = bias)
+            {
+                using var q = QuantizedMatrix.FromLinear(wp, n, k);
+                using var par = new Parallelism(4);
+                Int8Gemm.Multiply(ap, k, m, q, cp, n, par, useBias ? bp : null, acc, act);
+                bq = q.ToKN();
+            }
+            double maxErrQ = 0, maxErrF = 0, scaleRef = 0;
+            for (int i = 0; i < m; i++)
+            {
+                // The kernel's exact arithmetic: A quantized per row like the kernel, B dequantized.
+                double amax = 0;
+                for (int p = 0; p < k; p++) amax = Math.Max(amax, Math.Abs(a[i * k + p]));
+                float sa = amax > 0 ? (float)amax / 127f : 1f;
+                for (int j = 0; j < n; j++)
+                {
+                    double sq = 0, sf = 0;
+                    for (int p = 0; p < k; p++)
+                    {
+                        float qa = MathF.Round(a[i * k + p] * (1f / sa), MidpointRounding.ToEven) * sa;
+                        sq += (double)qa * bq[(long)p * n + j];
+                        sf += (double)a[i * k + p] * w[j * k + p];
+                    }
+                    if (useBias) { sq += bias[j]; sf += bias[j]; }
+                    if (acc) { sq += c0[i * n + j]; sf += c0[i * n + j]; }
+                    if (act == Activation.Silu) { sq = Silu(sq); sf = Silu(sf); }
+                    maxErrQ = Math.Max(maxErrQ, Math.Abs(sq - c[i * n + j]));
+                    maxErrF = Math.Max(maxErrF, Math.Abs(sf - c[i * n + j]));
+                    scaleRef = Math.Max(scaleRef, Math.Abs(sf));
+                }
+            }
+            output.WriteLine($"m={m} n={n} k={k} {mode}: vs dequantized {maxErrQ:E2}, vs fp32 {maxErrF:E2} (max |C| {scaleRef:F2})");
+            Assert.True(maxErrQ < 1e-4 * Math.Sqrt(k), $"int8 GEMM differs from its dequantized reference by {maxErrQ}");
+            Assert.True(maxErrF < 0.02 * scaleRef + 1e-3, $"int8 GEMM too far from fp32: {maxErrF}");
+        }
+    }
+
     [Fact]
     public void GemmPanelRangeWritesOnlyThoseColumns()
     {

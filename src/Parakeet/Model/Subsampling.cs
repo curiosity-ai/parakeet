@@ -18,7 +18,7 @@ internal sealed unsafe class Subsampling : IDisposable
     private readonly NativeBuffer<float>[] _dw, _dwb;               // depthwise: [9][C], bias
     private readonly PackedMatrix[] _pw;                            // pointwise C → C
     private readonly NativeBuffer<float>[] _pwb;
-    private readonly PackedMatrix _out;
+    private readonly LinearWeight _out;
     private readonly NativeBuffer<float> _outB;
 
     public Subsampling(WeightReader w, ParakeetConfig cfg)
@@ -52,7 +52,7 @@ internal sealed unsafe class Subsampling : IDisposable
             for (int c = 0; c < _c; c++)
                 for (int f = 0; f < fOut; f++)
                     perm.Ptr[(long)o * k + f * _c + c] = src[o * k + c * fOut + f];
-        _out = PackedMatrix.FromLinear(perm.Ptr, _d, k, hugePages: w.HugePages);
+        _out = LinearWeight.FromLinear(perm.Ptr, _d, k, 1f, w.Precision, w.HugePages);
         _outB = w.Vector(p + "out.bias", _d);
     }
 
@@ -130,7 +130,7 @@ internal sealed unsafe class Subsampling : IDisposable
                 free = dst + (long)rows * widths[s + 1] * _c;
             }
         });
-        Gemm.Multiply(scratch, rowOut, tOut, _out, output, _d, par, _outB.Ptr);
+        _out.Multiply(scratch, rowOut, tOut, output, _d, par, _outB.Ptr);
     }
 
     /// <summary>conv.0 (1 → C channels, 3×3, stride 2, pad 1) + ReLU for output rows [<paramref name="t0"/>, <paramref name="t1"/>)

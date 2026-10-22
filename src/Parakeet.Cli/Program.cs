@@ -19,6 +19,7 @@ if (args.Length == 0 || args[0] is "-h" or "--help")
           --threads <n>         worker threads (default: all cores)
           --runs <n>            bench: timed runs per file (default 3, after one warm-up)
           --zero-pad            NeMo-style zero padding for the STFT (default: reflect, like the ONNX export)
+          --int8                int8 encoder projections on AVX-VNNI (faster, approximate)
           --json                transcribe: print JSON with token and word timestamps
           --words               transcribe: print word timestamps
         """);
@@ -29,7 +30,7 @@ string command = args[0];
 var files = new List<string>();
 string model = ModelDownloader.DefaultRepo;
 int threads = 0, runs = 3;
-bool json = false, words = false, zeroPad = false;
+bool json = false, words = false, zeroPad = false, int8 = false;
 for (int i = 1; i < args.Length; i++)
 {
     switch (args[i])
@@ -40,6 +41,7 @@ for (int i = 1; i < args.Length; i++)
         case "--json": json = true; break;
         case "--words": words = true; break;
         case "--zero-pad": zeroPad = true; break;
+        case "--int8": int8 = true; break;
         default: files.Add(args[i]); break;
     }
 }
@@ -51,8 +53,13 @@ if (files.Count == 0)
 
 var progress = new Progress<string>(m => Console.Error.WriteLine(m));
 var sw = Stopwatch.StartNew();
-using var asr = await ParakeetAsr.LoadAsync(model, new ParakeetOptions { Threads = threads, PadMode = zeroPad ? StftPadMode.Constant : StftPadMode.Reflect }, progress);
-Console.Error.WriteLine($"Loaded in {sw.Elapsed.TotalSeconds:F1}s ({asr.Config.Layers} layers, d={asr.Config.DModel}, vocab {asr.Config.VocabSize}, {asr.Parallelism.MaxThreads} threads)");
+using var asr = await ParakeetAsr.LoadAsync(model, new ParakeetOptions
+{
+    Threads = threads,
+    PadMode = zeroPad ? StftPadMode.Constant : StftPadMode.Reflect,
+    Precision = int8 ? Parakeet.Numerics.WeightPrecision.Int8 : Parakeet.Numerics.WeightPrecision.Float32,
+}, progress);
+Console.Error.WriteLine($"Loaded in {sw.Elapsed.TotalSeconds:F1}s ({asr.Config.Layers} layers, d={asr.Config.DModel}, vocab {asr.Config.VocabSize}, {asr.Parallelism.MaxThreads} threads, {asr.Precision})");
 
 switch (command)
 {

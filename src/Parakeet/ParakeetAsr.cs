@@ -25,6 +25,10 @@ public sealed record ParakeetOptions
     /// this length, at <c>~200 KB × frames</c> of memory (default 512 frames ≈ 41 s of audio, ≈ 100 MB at most).
     /// 0 disables the cache.</summary>
     public int PositionCacheFrames { get; init; } = 512;
+
+    /// <summary>Precision of the encoder's large projections. <see cref="WeightPrecision.Int8"/> (opt-in) quantizes them
+    /// for AVX-VNNI: roughly twice the GEMM throughput and a quarter of the weight memory, with a small accuracy cost.</summary>
+    public WeightPrecision Precision { get; init; } = WeightPrecision.Float32;
 }
 
 /// <summary>A decoded token with its time span.</summary>
@@ -57,7 +61,8 @@ public sealed class ParakeetAsr : IDisposable
         Config = config with { Mel = config.Mel with { PadMode = options.PadMode } };
         Vocabulary = vocabulary;
         Parallelism = new Parallelism(options.Threads);
-        var w = new WeightReader(source, options.HugePages);
+        var w = new WeightReader(source, options.HugePages, options.Precision);
+        Precision = options.Precision == WeightPrecision.Int8 && Int8Gemm.IsSupported ? WeightPrecision.Int8 : WeightPrecision.Float32;
         float[]? fb = null, window = null;
         if (source.Contains("preprocessor.featurizer.fb")) fb = source.Get("preprocessor.featurizer.fb").ToArray();
         if (source.Contains("preprocessor.featurizer.window")) window = source.Get("preprocessor.featurizer.window").ToArray();
@@ -76,6 +81,9 @@ public sealed class ParakeetAsr : IDisposable
 
     public ParakeetConfig Config { get; }
     public Vocabulary Vocabulary { get; }
+
+    /// <summary>Effective precision of the encoder projections (Int8 falls back to Float32 without AVX-VNNI).</summary>
+    public WeightPrecision Precision { get; }
     public Parallelism Parallelism { get; }
     public MelSpectrogram Frontend { get; }
     public ConformerEncoder Encoder { get; }

@@ -8,12 +8,13 @@ using Parakeet.Benchmarks;
 // equally; medians are reported.
 //
 //   dotnet run -c Release --project benchmarks/Parakeet.Benchmarks -- \
-//       --model model.nemo --onnx onnx-dir [--threads 4] [--runs 7] [--int8] [--only csharp|onnx] file.wav ...
+//       --model model.nemo --onnx onnx-dir [--threads 4] [--runs 7] [--int8] [--cs-int8] [--only csharp|onnx] file.wav ...
+//   (--int8: ONNX Runtime runs the int8 export; --cs-int8: the C# engine uses its int8 encoder projections)
 //   dotnet run -c Release --project benchmarks/Parakeet.Benchmarks -- --gemm [--threads 4]
 
 string? model = null, onnx = null, only = null;
 int threads = Environment.ProcessorCount, runs = 7;
-bool int8 = false;
+bool int8 = false, csInt8 = false;
 var files = new List<string>();
 if (args.Contains("--gemm"))
 {
@@ -29,13 +30,14 @@ for (int i = 0; i < args.Length; i++)
         case "--threads": threads = int.Parse(args[++i]); break;
         case "--runs": runs = int.Parse(args[++i]); break;
         case "--int8": int8 = true; break;
+        case "--cs-int8": csInt8 = true; break;
         case "--only": only = args[++i]; break;
         default: files.Add(args[i]); break;
     }
 }
 if (files.Count == 0 || (model == null && onnx == null))
 {
-    Console.Error.WriteLine("usage: Parakeet.Benchmarks --model <.nemo|dir> --onnx <onnx dir> [--threads n] [--runs n] [--int8] [--only csharp|onnx] <file.wav>...");
+    Console.Error.WriteLine("usage: Parakeet.Benchmarks --model <.nemo|dir> --onnx <onnx dir> [--threads n] [--runs n] [--int8] [--cs-int8] [--only csharp|onnx] <file.wav>...");
     return 1;
 }
 
@@ -49,8 +51,12 @@ OnnxPipeline? pipe = null;
 var sw = Stopwatch.StartNew();
 if (model != null && only is null or "csharp")
 {
-    asr = ParakeetAsr.Load(model, new ParakeetOptions { Threads = threads });
-    Console.WriteLine($"Parakeet (pure C#) loaded in {sw.Elapsed.TotalSeconds:F1}s");
+    asr = ParakeetAsr.Load(model, new ParakeetOptions
+    {
+        Threads = threads,
+        Precision = csInt8 ? Parakeet.Numerics.WeightPrecision.Int8 : Parakeet.Numerics.WeightPrecision.Float32,
+    });
+    Console.WriteLine($"Parakeet (pure C#, {asr.Precision}) loaded in {sw.Elapsed.TotalSeconds:F1}s");
 }
 sw.Restart();
 if (onnx != null && only is null or "onnx")

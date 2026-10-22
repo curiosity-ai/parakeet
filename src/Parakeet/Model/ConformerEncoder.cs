@@ -11,12 +11,13 @@ internal sealed unsafe class ConformerLayer : IDisposable
     public NativeBuffer<float> NormFf1G = null!, NormFf1B = null!, NormAttG = null!, NormAttB = null!;
     public NativeBuffer<float> NormConvG = null!, NormConvB = null!, NormFf2G = null!, NormFf2B = null!;
     public NativeBuffer<float> NormOutG = null!, NormOutB = null!;
-    public PackedMatrix Ff1W1 = null!, Ff1W2 = null!, Ff2W1 = null!, Ff2W2 = null!;   // W2 carry the macaron ½
+    public LinearWeight Ff1W1 = null!, Ff1W2 = null!, Ff2W1 = null!, Ff2W2 = null!;   // W2 carry the macaron ½
     public NativeBuffer<float>? Ff1B1, Ff1B2, Ff2B1, Ff2B2;
-    public PackedMatrix Qkv = null!, Pos = null!, Out = null!;
+    public LinearWeight Qkv = null!, Out = null!;
+    public PackedMatrix Pos = null!;                                                  // cached per length, kept FP32
     public NativeBuffer<float>? QkvB, OutB;
     public NativeBuffer<float> BiasU = null!, BiasV = null!;
-    public PackedMatrix Pw1 = null!, Pw2 = null!;
+    public LinearWeight Pw1 = null!, Pw2 = null!;
     public NativeBuffer<float>? Pw1B, Pw2B;
     public NativeBuffer<float> DwW = null!, DwB = null!;                              // [kernel, d] with batch norm folded in
 
@@ -31,24 +32,24 @@ internal sealed unsafe class ConformerLayer : IDisposable
             NormConvG = w.Vector(p + "norm_conv.weight", d), NormConvB = w.Vector(p + "norm_conv.bias", d),
             NormFf2G = w.Vector(p + "norm_feed_forward2.weight", d), NormFf2B = w.Vector(p + "norm_feed_forward2.bias", d),
             NormOutG = w.Vector(p + "norm_out.weight", d), NormOutB = w.Vector(p + "norm_out.bias", d),
-            Ff1W1 = w.Linear(p + "feed_forward1.linear1.weight", ff, d),
-            Ff1W2 = w.Linear(p + "feed_forward1.linear2.weight", d, ff, 0.5f),
+            Ff1W1 = w.Projection(p + "feed_forward1.linear1.weight", ff, d),
+            Ff1W2 = w.Projection(p + "feed_forward1.linear2.weight", d, ff, 0.5f),
             Ff1B1 = w.OptionalVector(p + "feed_forward1.linear1.bias", ff),
             Ff1B2 = w.OptionalVector(p + "feed_forward1.linear2.bias", d, 0.5f),
-            Ff2W1 = w.Linear(p + "feed_forward2.linear1.weight", ff, d),
-            Ff2W2 = w.Linear(p + "feed_forward2.linear2.weight", d, ff, 0.5f),
+            Ff2W1 = w.Projection(p + "feed_forward2.linear1.weight", ff, d),
+            Ff2W2 = w.Projection(p + "feed_forward2.linear2.weight", d, ff, 0.5f),
             Ff2B1 = w.OptionalVector(p + "feed_forward2.linear1.bias", ff),
             Ff2B2 = w.OptionalVector(p + "feed_forward2.linear2.bias", d, 0.5f),
-            Qkv = w.FusedLinear(d, (p + "self_attn.linear_q.weight", d), (p + "self_attn.linear_k.weight", d), (p + "self_attn.linear_v.weight", d)),
+            Qkv = w.FusedProjection(d, (p + "self_attn.linear_q.weight", d), (p + "self_attn.linear_k.weight", d), (p + "self_attn.linear_v.weight", d)),
             QkvB = w.FusedBias((p + "self_attn.linear_q.bias", d), (p + "self_attn.linear_k.bias", d), (p + "self_attn.linear_v.bias", d)),
             Pos = w.Linear(p + "self_attn.linear_pos.weight", d, d),
-            Out = w.Linear(p + "self_attn.linear_out.weight", d, d),
+            Out = w.Projection(p + "self_attn.linear_out.weight", d, d),
             OutB = w.OptionalVector(p + "self_attn.linear_out.bias", d),
             BiasU = w.Vector(p + "self_attn.pos_bias_u", d),
             BiasV = w.Vector(p + "self_attn.pos_bias_v", d),
-            Pw1 = w.Linear(p + "conv.pointwise_conv1.weight", 2 * d, d),
+            Pw1 = w.Projection(p + "conv.pointwise_conv1.weight", 2 * d, d),
             Pw1B = w.OptionalVector(p + "conv.pointwise_conv1.bias", 2 * d),
-            Pw2 = w.Linear(p + "conv.pointwise_conv2.weight", d, d),
+            Pw2 = w.Projection(p + "conv.pointwise_conv2.weight", d, d),
             Pw2B = w.OptionalVector(p + "conv.pointwise_conv2.bias", d),
         };
         (l.DwW, l.DwB) = LoadDepthwise(w, p + "conv.", d, k, cfg.BatchNormEps);
@@ -189,15 +190,15 @@ public sealed unsafe class ConformerEncoder : IDisposable
             Profiler.Mark("layernorm");
             if (tr0) trace!("layer0.norm_ff1", h, t, d);
             Profiler.Mark("trace");
-            Gemm.Multiply(h, d, t, L.Ff1W1, big, ff, par, Ptr(L.Ff1B1), act: Activation.Silu);
-            Gemm.Multiply(big, ff, t, L.Ff1W2, x, d, par, Ptr(L.Ff1B2), accumulate: true);
+            L.Ff1W1.Multiply(h, d, t, big, ff, par, Ptr(L.Ff1B1), act: Activation.Silu);
+            L.Ff1W2.Multiply(big, ff, t, x, d, par, Ptr(L.Ff1B2), accumulate: true);
             Profiler.Mark("ff gemm");
             if (tr0) trace!("layer0.ff1", x, t, d);
 
             // Relative-position multi-head self-attention
             Ops.LayerNorm(x, h, t, d, L.NormAttG.Ptr, L.NormAttB.Ptr, eps, par);
             Profiler.Mark("layernorm");
-            Gemm.Multiply(h, d, t, L.Qkv, big, 3 * d, par, Ptr(L.QkvB));
+            L.Qkv.Multiply(h, d, t, big, 3 * d, par, Ptr(L.QkvB));
             Profiler.Mark("qkv gemm");
             float* pp = ws.P.Ptr;
             if (table == null) Gemm.Multiply(pe, d, 2 * t - 1, L.Pos, pp, d, par);
@@ -213,14 +214,14 @@ public sealed unsafe class ConformerEncoder : IDisposable
             Profiler.Mark("trace");
             RelPositionAttention.Forward(big, pp, t, d, _cfg.Heads, L.BiasU.Ptr, L.BiasV.Ptr, ctx, ws.Attn.Ptr, par);
             Profiler.Mark("attention");
-            Gemm.Multiply(ctx, d, t, L.Out, x, d, par, Ptr(L.OutB), accumulate: true);
+            L.Out.Multiply(ctx, d, t, x, d, par, Ptr(L.OutB), accumulate: true);
             Profiler.Mark("out gemm");
             if (tr0) trace!("layer0.attn", x, t, d);
 
             // Convolution module: pointwise → GLU → depthwise (+BN) → SiLU → pointwise
             Ops.LayerNorm(x, h, t, d, L.NormConvG.Ptr, L.NormConvB.Ptr, eps, par);
             Profiler.Mark("layernorm");
-            Gemm.Multiply(h, d, t, L.Pw1, big, 2 * d, par, Ptr(L.Pw1B));
+            L.Pw1.Multiply(h, d, t, big, 2 * d, par, Ptr(L.Pw1B));
             Profiler.Mark("conv gemm");
             Ops.Glu(big, ctx, t, d, par);
             Profiler.Mark("glu");
@@ -228,15 +229,15 @@ public sealed unsafe class ConformerEncoder : IDisposable
             Profiler.Mark("trace");
             Ops.DepthwiseConv1d(ctx, h, t, d, L.DwW.Ptr, _cfg.ConvKernel, L.DwB.Ptr, silu: true, par);
             Profiler.Mark("depthwise");
-            Gemm.Multiply(h, d, t, L.Pw2, x, d, par, Ptr(L.Pw2B), accumulate: true);
+            L.Pw2.Multiply(h, d, t, x, d, par, Ptr(L.Pw2B), accumulate: true);
             Profiler.Mark("conv gemm");
             if (tr0) trace!("layer0.conv", x, t, d);
 
             // ½ · FF2
             Ops.LayerNorm(x, h, t, d, L.NormFf2G.Ptr, L.NormFf2B.Ptr, eps, par);
             Profiler.Mark("layernorm");
-            Gemm.Multiply(h, d, t, L.Ff2W1, big, ff, par, Ptr(L.Ff2B1), act: Activation.Silu);
-            Gemm.Multiply(big, ff, t, L.Ff2W2, x, d, par, Ptr(L.Ff2B2), accumulate: true);
+            L.Ff2W1.Multiply(h, d, t, big, ff, par, Ptr(L.Ff2B1), act: Activation.Silu);
+            L.Ff2W2.Multiply(big, ff, t, x, d, par, Ptr(L.Ff2B2), accumulate: true);
             Profiler.Mark("ff gemm");
             if (tr0) trace!("layer0.ff2", x, t, d);
 
