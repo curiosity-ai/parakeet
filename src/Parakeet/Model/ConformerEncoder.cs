@@ -136,11 +136,18 @@ public sealed unsafe class ConformerEncoder : IDisposable
     {
         int t = _cfg.EncoderFrames(melFrames);
         var result = new float[(long)t * _cfg.DModel];
-        using var ws = new EncoderWorkspace(_cfg, t, _sub.ScratchSize(melFrames));
-        fixed (float* f = features)
-        fixed (float* r = result)
+        var ws = RentWorkspace(t, _sub.ScratchSize(melFrames));
+        try
         {
-            Forward(f, melFrames, r, ws, par, trace);
+            fixed (float* f = features)
+            fixed (float* r = result)
+            {
+                Forward(f, melFrames, r, ws, par, trace);
+            }
+        }
+        finally
+        {
+            ReturnWorkspace(ws);
         }
         return result;
     }
@@ -231,8 +238,36 @@ public sealed unsafe class ConformerEncoder : IDisposable
 
     private static float* Ptr(NativeBuffer<float>? b) => b == null ? null : b.Ptr;
 
+    // Activation buffers are pooled: allocating them per call costs a page fault and kernel zeroing per page
+    // (hundreds of MB for long audio). Each concurrent caller rents its own workspace; capacities grow in 64-frame steps.
+    private readonly System.Collections.Concurrent.ConcurrentBag<EncoderWorkspace> _pool = new();
+
+    private EncoderWorkspace RentWorkspace(int frames, long subScratch)
+    {
+        while (_pool.TryTake(out var ws))
+        {
+            if (ws.Frames >= frames && ws.Sub.Length >= subScratch) return ws;
+            ws.Dispose();
+        }
+        int cap = (frames + 63) / 64 * 64;
+        return new EncoderWorkspace(_cfg, cap, Math.Max(subScratch, (long)cap * _cfg.Mel.Features / 8 * _cfg.SubsamplingChannels));
+    }
+
+    private void ReturnWorkspace(EncoderWorkspace ws)
+    {
+        if (_pool.Count < Environment.ProcessorCount) _pool.Add(ws);
+        else ws.Dispose();
+    }
+
+    /// <summary>Releases pooled activation buffers (they are re-created on demand).</summary>
+    public void TrimWorkspaces()
+    {
+        while (_pool.TryTake(out var ws)) ws.Dispose();
+    }
+
     public void Dispose()
     {
+        TrimWorkspaces();
         _sub?.Dispose();
         if (_layers != null)
             foreach (var l in _layers) l?.Dispose();

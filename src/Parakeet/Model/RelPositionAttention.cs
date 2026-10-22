@@ -17,7 +17,7 @@ namespace Parakeet.Model;
 /// </summary>
 internal static unsafe class RelPositionAttention
 {
-    private const int RowBlock = 64;
+    private static readonly int RowBlock = int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_RB"), out int rb) ? rb : 64;
     private const int NR = PackedMatrix.NR;
 
     [ThreadStatic] private static NativeBuffer<float>? t_scratch;
@@ -43,6 +43,7 @@ internal static unsafe class RelPositionAttention
             else PackedMatrix.PackLinear(p + h * dk, 2 * t - 1, dk, dModel, basePtr + kSize + vSize);
         });
 
+        Profiler.Mark("attention pack");
         int blocks = (t + RowBlock - 1) / RowBlock;
         float scale = 1f / MathF.Sqrt(dk);
         par.For(heads * blocks, item =>

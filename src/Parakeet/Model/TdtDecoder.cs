@@ -97,15 +97,14 @@ public sealed unsafe class TdtDecoder : IDisposable
         using var predProj = new NativeBuffer<float>(_j, zero: false);
         using var hidden = new NativeBuffer<float>(_j, zero: false);
         using var logits = new NativeBuffer<float>(_outDim, zero: false);
-        var single = Parallelism.Single;
 
         fixed (float* enc = encoder)
             Gemm.Multiply(enc, _cfg.DModel, frames, _jointEnc, encProj.Ptr, _j, par, _jointEncB.Ptr);
 
         // Prediction network on the start symbol (blank): its embedding row is all zeros (blank_as_pad).
         int last = blank;
-        Predict(last, state.Ptr, next.Ptr, gates.Ptr, cat.Ptr);
-        Gemm.Multiply(next.Ptr + (2L * (_layers - 1)) * h, h, 1, _jointPred, predProj.Ptr, _j, single, _jointPredB.Ptr);
+        Predict(last, state.Ptr, next.Ptr, gates.Ptr, cat.Ptr, par);
+        Gemm.Multiply(next.Ptr + (2L * (_layers - 1)) * h, h, 1, _jointPred, predProj.Ptr, _j, par, _jointPredB.Ptr);
 
         int t = 0;
         while (t < frames)
@@ -117,7 +116,7 @@ public sealed unsafe class TdtDecoder : IDisposable
                 // joint: relu(enc_t + pred) → logits
                 float* e = encProj.Ptr + (long)t * _j;
                 for (int i = 0; i < _j; i++) hidden.Ptr[i] = MathF.Max(e[i] + predProj.Ptr[i], 0f);
-                Gemm.Multiply(hidden.Ptr, _j, 1, _jointOut, logits.Ptr, _outDim, single, _jointOutB.Ptr);
+                Gemm.Multiply(hidden.Ptr, _j, 1, _jointOut, logits.Ptr, _outDim, par, _jointOutB.Ptr);
                 onStep?.Invoke(t, logits.Ptr, _outDim);
                 int k = Ops.ArgMax(logits.Ptr, vocab);
                 skip = _cfg.Durations[Ops.ArgMax(logits.Ptr + vocab, nDur)];
@@ -130,8 +129,8 @@ public sealed unsafe class TdtDecoder : IDisposable
                     // Commit the state computed for `last` and advance the prediction network with the new token.
                     Buffer.MemoryCopy(next.Ptr, state.Ptr, 2L * _layers * h * 4, 2L * _layers * h * 4);
                     last = k;
-                    Predict(last, state.Ptr, next.Ptr, gates.Ptr, cat.Ptr);
-                    Gemm.Multiply(next.Ptr + (2L * (_layers - 1)) * h, h, 1, _jointPred, predProj.Ptr, _j, single, _jointPredB.Ptr);
+                    Predict(last, state.Ptr, next.Ptr, gates.Ptr, cat.Ptr, par);
+                    Gemm.Multiply(next.Ptr + (2L * (_layers - 1)) * h, h, 1, _jointPred, predProj.Ptr, _j, par, _jointPredB.Ptr);
                 }
                 t += skip;
                 // A blank with duration 0 would re-evaluate the same inputs until max_symbols: stop right away.
@@ -144,10 +143,9 @@ public sealed unsafe class TdtDecoder : IDisposable
 
     /// <summary>One prediction-network step: feeds <paramref name="token"/> with state <paramref name="s"/>
     /// (<c>[layer][h, c]</c>) and writes the new state to <paramref name="o"/>; the output is layer L-1's h.</summary>
-    private void Predict(int token, float* s, float* o, float* gates, float* cat)
+    private void Predict(int token, float* s, float* o, float* gates, float* cat, Parallelism par)
     {
         int h = _h, g = 4 * h;
-        var single = Parallelism.Single;
         for (int l = 0; l < _layers; l++)
         {
             float* hPrev = s + 2L * l * h, cPrev = hPrev + h;
@@ -155,13 +153,13 @@ public sealed unsafe class TdtDecoder : IDisposable
             if (l == 0)
             {
                 Buffer.MemoryCopy(_embedIn.Ptr + (long)token * g, gates, g * 4, g * 4);
-                Gemm.Multiply(hPrev, h, 1, _whh0, gates, g, single, accumulate: true);
+                Gemm.Multiply(hPrev, h, 1, _whh0, gates, g, par, accumulate: true);
             }
             else
             {
                 Buffer.MemoryCopy(o + 2L * (l - 1) * h, cat, h * 4, h * 4);
                 Buffer.MemoryCopy(hPrev, cat + h, h * 4, h * 4);
-                Gemm.Multiply(cat, 2 * h, 1, _wcat[l - 1], gates, g, single, _bcat[l - 1].Ptr);
+                Gemm.Multiply(cat, 2 * h, 1, _wcat[l - 1], gates, g, par, _bcat[l - 1].Ptr);
             }
             // PyTorch gate order: input, forget, cell, output.
             for (int i = 0; i < h; i++)

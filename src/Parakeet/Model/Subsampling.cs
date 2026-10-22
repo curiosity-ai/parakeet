@@ -64,113 +64,169 @@ internal sealed unsafe class Subsampling : IDisposable
 
     private static int Half(int n) => (n - 1) / 2 + 1;
 
-    /// <summary>Floats of scratch needed for <paramref name="frames"/> feature frames (two ping-pong buffers).</summary>
-    public long ScratchSize(int frames) => 2L * Half(frames) * Half(_fIn) * _c;
+    /// <summary>Floats of the flattened <c>[EncoderFrames(frames), C·F/8]</c> buffer the final linear reads.</summary>
+    public long ScratchSize(int frames)
+    {
+        int t = frames, w = _fIn;
+        for (int s = 0; s < _stages; s++) { t = Half(t); w = Half(w); }
+        return (long)t * w * _c;
+    }
 
-    /// <summary>Maps <c>[frames, features]</c> to <c>[EncoderFrames(frames), d_model]</c>.</summary>
+    [ThreadStatic] private static NativeBuffer<float>? t_chunk;
+
+    /// <summary>
+    /// Maps <c>[frames, features]</c> to <c>[EncoderFrames(frames), d_model]</c>. The convolutions run in independent
+    /// bands of output frames, one band per work item: each band recomputes the few rows its 3×3 receptive field
+    /// shares with its neighbours and keeps its intermediate activations in a small per-thread buffer, so the large
+    /// full-resolution feature maps never stream through memory. The final linear is one GEMM over all frames.
+    /// </summary>
     public void Forward(float* feats, int frames, float* output, float* scratch, Parallelism par)
     {
-        int h = Half(frames), wdt = Half(_fIn);
-        float* a = scratch, b = scratch + (long)h * wdt * _c;
-        Conv0(feats, frames, _fIn, a, par);
-        for (int s = 0; s < _stages - 1; s++)
+        var heights = new int[_stages + 1];
+        var widths = new int[_stages + 1];
+        heights[0] = frames;
+        widths[0] = _fIn;
+        for (int s = 1; s <= _stages; s++)
         {
-            int h2 = Half(h), w2 = Half(wdt);
-            Depthwise(a, h, wdt, b, _dw[s].Ptr, _dwb[s].Ptr, par);
-            Gemm.Multiply(b, _c, h2 * w2, _pw[s], a, _c, par, _pwb[s].Ptr, act: Activation.Relu);
-            h = h2;
-            wdt = w2;
+            heights[s] = Half(heights[s - 1]);
+            widths[s] = Half(widths[s - 1]);
         }
-        Gemm.Multiply(a, (long)wdt * _c, h, _out, output, _d, par, _outB.Ptr);
+        int tOut = heights[_stages];
+        long rowOut = (long)widths[_stages] * _c;
+        int band = Math.Clamp((tOut + 2 * par.MaxThreads - 1) / (2 * par.MaxThreads), 1, 8);
+        int bands = (tOut + band - 1) / band;
+        par.For(bands, bi =>
+        {
+            int a = bi * band, b = Math.Min(tOut, a + band);
+            // Row ranges needed at every level (row r at level s+1 reads rows 2r-1 .. 2r+1 at level s).
+            Span<int> lo = stackalloc int[_stages + 1], hi = stackalloc int[_stages + 1];
+            lo[_stages] = a;
+            hi[_stages] = b;
+            for (int s = _stages - 1; s >= 1; s--)
+            {
+                lo[s] = Math.Max(0, 2 * lo[s + 1] - 1);
+                hi[s] = Math.Min(heights[s], 2 * hi[s + 1]);
+            }
+            long need = 0;
+            for (int s = 1; s < _stages; s++) need += 2L * (hi[s] - lo[s]) * widths[s] * _c;
+            var buf = t_chunk;
+            if (buf == null || buf.Length < need)
+            {
+                buf?.Dispose();
+                buf = t_chunk = new NativeBuffer<float>(Math.Max(need, 1 << 16), zero: false);
+            }
+            float* cur = buf.Ptr;                      // level-1 activations (conv.0 + ReLU)
+            Conv0(feats, heights[0], widths[0], lo[1], hi[1], cur);
+            float* free = cur + (long)(hi[1] - lo[1]) * widths[1] * _c;
+            for (int s = 1; s < _stages; s++)
+            {
+                int rows = hi[s + 1] - lo[s + 1];
+                float* dw = free;
+                Depthwise(cur, lo[s], heights[s], widths[s], lo[s + 1], hi[s + 1], dw, _dw[s - 1].Ptr, _dwb[s - 1].Ptr);
+                // The last stage writes straight into the flattened buffer of the final linear.
+                float* dst = s + 1 == _stages ? scratch + lo[s + 1] * rowOut : dw + (long)rows * widths[s + 1] * _c;
+                Gemm.Multiply(dw, _c, rows * widths[s + 1], _pw[s - 1], dst, _c, Parallelism.Single, _pwb[s - 1].Ptr, act: Activation.Relu);
+                cur = dst;
+                free = dst + (long)rows * widths[s + 1] * _c;
+            }
+        });
+        Gemm.Multiply(scratch, rowOut, tOut, _out, output, _d, par, _outB.Ptr);
     }
 
-    /// <summary>conv.0 (1 → C channels, 3×3, stride 2, pad 1) + ReLU over the <c>[h, w]</c> input image.</summary>
-    private void Conv0(float* x, int h, int w, float* y, Parallelism par)
+    /// <summary>conv.0 (1 → C channels, 3×3, stride 2, pad 1) + ReLU for output rows [<paramref name="t0"/>, <paramref name="t1"/>)
+    /// of the <c>[h, w]</c> input image; row t is written at <c>y + (t - t0)·wo·C</c>.</summary>
+    private void Conv0(float* x, int h, int w, int t0, int t1, float* y)
     {
-        int ho = Half(h), wo = Half(w), C = _c;
+        int wo = Half(w), C = _c;
         float* wt = _w0.Ptr, bias = _b0.Ptr;
-        par.ForRange(ho, 4, (t0, t1) =>
-        {
-            float* tap = stackalloc float[9];
-            for (int t = t0; t < t1; t++)
-                for (int f = 0; f < wo; f++)
-                {
-                    for (int dy = 0; dy < 3; dy++)
-                        for (int dx = 0; dx < 3; dx++)
-                        {
-                            int r = 2 * t + dy - 1, c = 2 * f + dx - 1;
-                            tap[dy * 3 + dx] = r >= 0 && r < h && c >= 0 && c < w ? x[(long)r * w + c] : 0f;
-                        }
-                    float* o = y + ((long)t * wo + f) * C;
-                    int ch = 0;
-                    if (Avx512F.IsSupported)
+        float* tap = stackalloc float[9];
+        for (int t = t0; t < t1; t++)
+            for (int f = 0; f < wo; f++)
+            {
+                for (int dy = 0; dy < 3; dy++)
+                    for (int dx = 0; dx < 3; dx++)
                     {
-                        for (; ch + 16 <= C; ch += 16)
-                        {
-                            var acc = Vector512.Load(bias + ch);
-                            for (int k = 0; k < 9; k++) acc = Avx512F.FusedMultiplyAdd(Vector512.Create(tap[k]), Vector512.Load(wt + k * C + ch), acc);
-                            Vector512.Store(Vector512.Max(acc, Vector512<float>.Zero), o + ch);
-                        }
+                        int r = 2 * t + dy - 1, c = 2 * f + dx - 1;
+                        tap[dy * 3 + dx] = r >= 0 && r < h && c >= 0 && c < w ? x[(long)r * w + c] : 0f;
                     }
-                    for (; ch < C; ch++)
+                float* o = y + ((long)(t - t0) * wo + f) * C;
+                int ch = 0;
+                if (Avx512F.IsSupported)
+                {
+                    var k0 = Vector512.Create(tap[0]); var k1 = Vector512.Create(tap[1]); var k2 = Vector512.Create(tap[2]);
+                    var k3 = Vector512.Create(tap[3]); var k4 = Vector512.Create(tap[4]); var k5 = Vector512.Create(tap[5]);
+                    var k6 = Vector512.Create(tap[6]); var k7 = Vector512.Create(tap[7]); var k8 = Vector512.Create(tap[8]);
+                    for (; ch + 16 <= C; ch += 16)
                     {
-                        float acc = bias[ch];
-                        for (int k = 0; k < 9; k++) acc = MathF.FusedMultiplyAdd(tap[k], wt[k * C + ch], acc);
-                        o[ch] = MathF.Max(acc, 0f);
+                        var acc = Vector512.Load(bias + ch);
+                        acc = Avx512F.FusedMultiplyAdd(k0, Vector512.Load(wt + ch), acc);
+                        acc = Avx512F.FusedMultiplyAdd(k1, Vector512.Load(wt + C + ch), acc);
+                        acc = Avx512F.FusedMultiplyAdd(k2, Vector512.Load(wt + 2 * C + ch), acc);
+                        acc = Avx512F.FusedMultiplyAdd(k3, Vector512.Load(wt + 3 * C + ch), acc);
+                        acc = Avx512F.FusedMultiplyAdd(k4, Vector512.Load(wt + 4 * C + ch), acc);
+                        acc = Avx512F.FusedMultiplyAdd(k5, Vector512.Load(wt + 5 * C + ch), acc);
+                        acc = Avx512F.FusedMultiplyAdd(k6, Vector512.Load(wt + 6 * C + ch), acc);
+                        acc = Avx512F.FusedMultiplyAdd(k7, Vector512.Load(wt + 7 * C + ch), acc);
+                        acc = Avx512F.FusedMultiplyAdd(k8, Vector512.Load(wt + 8 * C + ch), acc);
+                        Vector512.Store(Vector512.Max(acc, Vector512<float>.Zero), o + ch);
                     }
                 }
-        });
+                for (; ch < C; ch++)
+                {
+                    float acc = bias[ch];
+                    for (int k = 0; k < 9; k++) acc = MathF.FusedMultiplyAdd(tap[k], wt[k * C + ch], acc);
+                    o[ch] = MathF.Max(acc, 0f);
+                }
+            }
     }
 
-    /// <summary>Depthwise 3×3, stride 2, pad 1 over channels-last <c>[h, w, C]</c>.</summary>
-    private void Depthwise(float* x, int h, int w, float* y, float* wt, float* bias, Parallelism par)
+    /// <summary>Depthwise 3×3, stride 2, pad 1 over channels-last <c>[h, w, C]</c> for output rows [<paramref name="t0"/>, <paramref name="t1"/>).
+    /// Input row r (global index) lives at <c>x + (r - xRow0)·w·C</c>; output row t at <c>y + (t - t0)·wo·C</c>.</summary>
+    private void Depthwise(float* x, int xRow0, int h, int w, int t0, int t1, float* y, float* wt, float* bias)
     {
-        int ho = Half(h), wo = Half(w), C = _c;
-        par.ForRange(ho, 2, (t0, t1) =>
-        {
-            for (int t = t0; t < t1; t++)
-                for (int f = 0; f < wo; f++)
+        int wo = Half(w), C = _c;
+        for (int t = t0; t < t1; t++)
+            for (int f = 0; f < wo; f++)
+            {
+                float* o = y + ((long)(t - t0) * wo + f) * C;
+                int ch = 0;
+                if (Avx512F.IsSupported)
                 {
-                    float* o = y + ((long)t * wo + f) * C;
-                    int ch = 0;
-                    if (Avx512F.IsSupported)
+                    for (; ch + 16 <= C; ch += 16)
                     {
-                        for (; ch + 16 <= C; ch += 16)
-                        {
-                            var acc = Vector512.Load(bias + ch);
-                            for (int dy = 0; dy < 3; dy++)
-                            {
-                                int r = 2 * t + dy - 1;
-                                if (r < 0 || r >= h) continue;
-                                for (int dx = 0; dx < 3; dx++)
-                                {
-                                    int c = 2 * f + dx - 1;
-                                    if (c < 0 || c >= w) continue;
-                                    acc = Avx512F.FusedMultiplyAdd(Vector512.Load(wt + (dy * 3 + dx) * C + ch),
-                                                                   Vector512.Load(x + ((long)r * w + c) * C + ch), acc);
-                                }
-                            }
-                            Vector512.Store(acc, o + ch);
-                        }
-                    }
-                    for (; ch < C; ch++)
-                    {
-                        float acc = bias[ch];
+                        var acc = Vector512.Load(bias + ch);
                         for (int dy = 0; dy < 3; dy++)
                         {
                             int r = 2 * t + dy - 1;
                             if (r < 0 || r >= h) continue;
+                            float* row = x + (long)(r - xRow0) * w * C;
                             for (int dx = 0; dx < 3; dx++)
                             {
                                 int c = 2 * f + dx - 1;
                                 if (c < 0 || c >= w) continue;
-                                acc = MathF.FusedMultiplyAdd(wt[(dy * 3 + dx) * C + ch], x[((long)r * w + c) * C + ch], acc);
+                                acc = Avx512F.FusedMultiplyAdd(Vector512.Load(wt + (dy * 3 + dx) * C + ch), Vector512.Load(row + (long)c * C + ch), acc);
                             }
                         }
-                        o[ch] = acc;
+                        Vector512.Store(acc, o + ch);
                     }
                 }
-        });
+                for (; ch < C; ch++)
+                {
+                    float acc = bias[ch];
+                    for (int dy = 0; dy < 3; dy++)
+                    {
+                        int r = 2 * t + dy - 1;
+                        if (r < 0 || r >= h) continue;
+                        for (int dx = 0; dx < 3; dx++)
+                        {
+                            int c = 2 * f + dx - 1;
+                            if (c < 0 || c >= w) continue;
+                            acc = MathF.FusedMultiplyAdd(wt[(dy * 3 + dx) * C + ch], x[((long)(r - xRow0) * w + c) * C + ch], acc);
+                        }
+                    }
+                    o[ch] = acc;
+                }
+            }
     }
 
     /// <summary>Reorders a <c>[C, 1, 3, 3]</c> kernel to tap-major <c>[9, C]</c>.</summary>

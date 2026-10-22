@@ -4,12 +4,15 @@ using Parakeet.Audio;
 using Parakeet.Benchmarks;
 
 // Pure C# Parakeet vs the ONNX Runtime pipeline of the original Go server, same machine, same thread count.
+// Runs of the two engines are interleaved per clip (C#, ORT, C#, ORT, ...) so slow drifts of a shared machine hit both
+// equally; medians are reported.
 //
 //   dotnet run -c Release --project benchmarks/Parakeet.Benchmarks -- \
-//       --model model.nemo --onnx onnx-dir [--threads 4] [--runs 5] [--int8] [--only csharp|onnx] file.wav ...
+//       --model model.nemo --onnx onnx-dir [--threads 4] [--runs 7] [--int8] [--only csharp|onnx] file.wav ...
+//   dotnet run -c Release --project benchmarks/Parakeet.Benchmarks -- --gemm [--threads 4]
 
 string? model = null, onnx = null, only = null;
-int threads = Environment.ProcessorCount, runs = 5;
+int threads = Environment.ProcessorCount, runs = 7;
 bool int8 = false;
 var files = new List<string>();
 if (args.Contains("--gemm"))
@@ -38,59 +41,92 @@ if (files.Count == 0 || (model == null && onnx == null))
 
 var clips = files.Select(f => (Name: Path.GetFileNameWithoutExtension(f), Audio: WaveFile.ReadMono(f))).ToList();
 double totalAudio = clips.Sum(c => c.Audio.Length / 16000.0);
-Console.WriteLine($"{clips.Count} clips, {totalAudio:F1}s audio, {threads} threads, best of {runs} runs after a warm-up, {Environment.ProcessorCount} cores");
-Console.WriteLine();
+Console.WriteLine($"{clips.Count} clips, {totalAudio:F1}s audio, {threads} threads, median of {runs} interleaved runs after a warm-up, " +
+                  $"{Environment.ProcessorCount} cores, .NET {Environment.Version}");
 
-var csharp = new Dictionary<string, (double Feat, double Enc, double Dec, double Total, string Text)>();
-var ort = new Dictionary<string, (double Feat, double Enc, double Dec, double Total, string Text)>();
-
+ParakeetAsr? asr = null;
+OnnxPipeline? pipe = null;
+var sw = Stopwatch.StartNew();
 if (model != null && only is null or "csharp")
 {
-    var sw = Stopwatch.StartNew();
-    using var asr = ParakeetAsr.Load(model ?? onnx!, new ParakeetOptions { Threads = threads });
+    asr = ParakeetAsr.Load(model, new ParakeetOptions { Threads = threads });
     Console.WriteLine($"Parakeet (pure C#) loaded in {sw.Elapsed.TotalSeconds:F1}s");
-    foreach (var (name, audio) in clips)
-    {
-        asr.Transcribe(audio);
-        var rs = Enumerable.Range(0, runs).Select(_ => asr.Transcribe(audio)).ToList();
-        csharp[name] = (rs.Min(r => r.FeatureTime.TotalMilliseconds), rs.Min(r => r.EncoderTime.TotalMilliseconds),
-                        rs.Min(r => r.DecoderTime.TotalMilliseconds), rs.Min(r => r.TotalTime.TotalMilliseconds), rs[0].Text);
-        Print("C#  ", name, audio.Length, csharp[name]);
-    }
-    Console.WriteLine();
 }
-
+sw.Restart();
 if (onnx != null && only is null or "onnx")
 {
-    var sw = Stopwatch.StartNew();
-    using var pipe = new OnnxPipeline(onnx, threads, int8);
+    pipe = new OnnxPipeline(onnx, threads, int8);
     Console.WriteLine($"ONNX Runtime {typeof(Microsoft.ML.OnnxRuntime.InferenceSession).Assembly.GetName().Version} ({pipe.EncoderFile}) loaded in {sw.Elapsed.TotalSeconds:F1}s");
-    foreach (var (name, audio) in clips)
+}
+Console.WriteLine();
+
+var cs = new List<Stage>();
+var ort = new List<Stage>();
+int same = 0;
+foreach (var (name, audio) in clips)
+{
+    var c = new List<Stage>();
+    var o = new List<Stage>();
+    string? ct = null, ot = null;
+    asr?.Transcribe(audio);
+    pipe?.Transcribe(audio);
+    for (int r = 0; r < runs; r++)
     {
-        pipe.Transcribe(audio);
-        var rs = Enumerable.Range(0, runs).Select(_ => pipe.Transcribe(audio)).ToList();
-        ort[name] = (rs.Min(r => r.Features.TotalMilliseconds), rs.Min(r => r.Encoder.TotalMilliseconds),
-                     rs.Min(r => r.Decoder.TotalMilliseconds), rs.Min(r => r.Total.TotalMilliseconds), rs[0].Text);
-        Print("ORT ", name, audio.Length, ort[name]);
+        if (asr != null)
+        {
+            var x = asr.Transcribe(audio);
+            ct = x.Text;
+            c.Add(new Stage(x.FeatureTime.TotalMilliseconds, x.EncoderTime.TotalMilliseconds, x.DecoderTime.TotalMilliseconds));
+        }
+        if (pipe != null)
+        {
+            var y = pipe.Transcribe(audio);
+            ot = y.Text;
+            o.Add(new Stage(y.Features.TotalMilliseconds, y.Encoder.TotalMilliseconds, y.Decoder.TotalMilliseconds));
+        }
     }
-    Console.WriteLine();
+    double secs = audio.Length / 16000.0;
+    if (c.Count > 0) { var m = Stage.Median(c); cs.Add(m); Print("C#  ", name, secs, m); }
+    if (o.Count > 0) { var m = Stage.Median(o); ort.Add(m); Print("ORT ", name, secs, m); }
+    if (ct != null && ot != null)
+    {
+        if (ct == ot) same++;
+        else Console.WriteLine($"     transcripts differ:\n       C#:  {ct}\n       ORT: {ot}");
+    }
 }
 
-if (csharp.Count > 0 && ort.Count > 0)
+if (cs.Count > 0 && ort.Count > 0)
 {
-    double cs = csharp.Values.Sum(v => v.Total), os = ort.Values.Sum(v => v.Total);
-    double ce = csharp.Values.Sum(v => v.Enc), oe = ort.Values.Sum(v => v.Enc);
-    double cd = csharp.Values.Sum(v => v.Dec), od = ort.Values.Sum(v => v.Dec);
-    double cf = csharp.Values.Sum(v => v.Feat), of = ort.Values.Sum(v => v.Feat);
-    int same = clips.Count(c => csharp[c.Name].Text == ort[c.Name].Text);
+    var c = Stage.Sum(cs);
+    var o = Stage.Sum(ort);
+    Console.WriteLine();
     Console.WriteLine($"{"",-10} {"features",10} {"encoder",10} {"decoder",10} {"total",10} {"RTF",8}");
-    Console.WriteLine($"{"C#",-10} {cf,8:F0}ms {ce,8:F0}ms {cd,8:F0}ms {cs,8:F0}ms {cs / 1000 / totalAudio,8:F4}");
-    Console.WriteLine($"{"ORT",-10} {of,8:F0}ms {oe,8:F0}ms {od,8:F0}ms {os,8:F0}ms {os / 1000 / totalAudio,8:F4}");
-    Console.WriteLine($"{"speed-up",-10} {of / cf,9:F2}x {oe / ce,9:F2}x {od / cd,9:F2}x {os / cs,9:F2}x");
+    Console.WriteLine($"{"C#",-10} {c.Features,8:F0}ms {c.Encoder,8:F0}ms {c.Decoder,8:F0}ms {c.Total,8:F0}ms {c.Total / 1000 / totalAudio,8:F4}");
+    Console.WriteLine($"{"ORT",-10} {o.Features,8:F0}ms {o.Encoder,8:F0}ms {o.Decoder,8:F0}ms {o.Total,8:F0}ms {o.Total / 1000 / totalAudio,8:F4}");
+    Console.WriteLine($"{"speed-up",-10} {o.Features / c.Features,9:F2}x {o.Encoder / c.Encoder,9:F2}x {o.Decoder / c.Decoder,9:F2}x {o.Total / c.Total,9:F2}x");
     Console.WriteLine($"identical transcripts: {same}/{clips.Count}");
 }
+asr?.Dispose();
+pipe?.Dispose();
 return 0;
 
-static void Print(string who, string name, int samples, (double Feat, double Enc, double Dec, double Total, string Text) r) =>
-    Console.WriteLine($"{who} {name,-40} {samples / 16000.0,5:F1}s  feat {r.Feat,6:F0} ms  enc {r.Enc,6:F0} ms  dec {r.Dec,5:F0} ms  " +
-                      $"total {r.Total,6:F0} ms  RTF {r.Total / 1000 / (samples / 16000.0):F4}");
+static void Print(string who, string name, double secs, Stage r) =>
+    Console.WriteLine($"{who} {name,-40} {secs,5:F1}s  feat {r.Features,6:F0} ms  enc {r.Encoder,6:F0} ms  dec {r.Decoder,5:F0} ms  " +
+                      $"total {r.Total,6:F0} ms  RTF {r.Total / 1000 / secs:F4}");
+
+internal readonly record struct Stage(double Features, double Encoder, double Decoder)
+{
+    public double Total => Features + Encoder + Decoder;
+
+    public static Stage Median(List<Stage> runs)
+    {
+        static double Med(IEnumerable<double> v)
+        {
+            var a = v.OrderBy(x => x).ToArray();
+            return a.Length % 2 == 1 ? a[a.Length / 2] : (a[a.Length / 2 - 1] + a[a.Length / 2]) / 2;
+        }
+        return new Stage(Med(runs.Select(r => r.Features)), Med(runs.Select(r => r.Encoder)), Med(runs.Select(r => r.Decoder)));
+    }
+
+    public static Stage Sum(List<Stage> s) => new(s.Sum(x => x.Features), s.Sum(x => x.Encoder), s.Sum(x => x.Decoder));
+}
