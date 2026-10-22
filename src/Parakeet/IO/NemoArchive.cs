@@ -24,7 +24,8 @@ public sealed class NemoArchive : ITensorSource
                 yaml = File.ReadAllText(System.IO.Path.Combine(path, "model_config.yaml"));
                 var ckpt = Map(System.IO.Path.Combine(path, "model_weights.ckpt"));
                 _ckpt = new TorchCheckpoint(ckpt, 0, ckpt.Length);
-                Vocabulary = ReadVocabulary(Directory.GetFiles(path).Select(f => (System.IO.Path.GetFileName(f), File.ReadAllBytes(f) as byte[])).Where(f => IsVocabFile(f.Item1)));
+                Vocabulary = ReadVocabulary(Directory.GetFiles(path).Where(f => IsVocabFile(System.IO.Path.GetFileName(f)))
+                    .Select(f => (System.IO.Path.GetFileName(f), File.ReadAllBytes(f))));
             }
             else
             {

@@ -13,9 +13,15 @@ internal sealed unsafe class MappedFile : IDisposable
     public MappedFile(string path)
     {
         Path = path;
-        Length = new FileInfo(path).Length;
-        if (Length == 0) throw new InvalidDataException($"{path} is empty.");
-        _mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+        // Open the file itself (following symbolic links; FileInfo.Length would report a link's own size).
+        var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        Length = fs.Length;
+        if (Length == 0)
+        {
+            fs.Dispose();
+            throw new InvalidDataException($"{path} is empty.");
+        }
+        _mmf = MemoryMappedFile.CreateFromFile(fs, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
         _view = _mmf.CreateViewAccessor(0, Length, MemoryMappedFileAccess.Read);
         _view.SafeMemoryMappedViewHandle.AcquirePointer(ref _ptr);
         _ptr += _view.PointerOffset;

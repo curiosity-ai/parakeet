@@ -29,7 +29,7 @@ public static class ModelDownloader
 
         var (file, size) = await FindNemoFileAsync(http, modelOrRepo, ct).ConfigureAwait(false);
         string dest = Path.Combine(dir, file);
-        if (File.Exists(dest) && (size <= 0 || new FileInfo(dest).Length == size)) return dest;
+        if (File.Exists(dest) && (size <= 0 || ResolvedLength(dest) == size)) return dest;
 
         string partial = dest + ".partial";
         string url = $"https://huggingface.co/{modelOrRepo}/resolve/main/{file}";
@@ -80,6 +80,13 @@ public static class ModelDownloader
             // Offline / API unavailable: fall back to the conventional file name.
             return (repo[(repo.LastIndexOf('/') + 1)..] + ".nemo", -1);
         }
+    }
+
+    /// <summary>Length of the file, following a symbolic link (FileInfo.Length reports the link itself).</summary>
+    private static long ResolvedLength(string path)
+    {
+        var fi = new FileInfo(path);
+        return (fi.LinkTarget != null ? fi.ResolveLinkTarget(true) as FileInfo : null)?.Length ?? fi.Length;
     }
 
     private static string FormatSize(long bytes) => bytes <= 0 ? "unknown size" : $"{bytes / 1e9:F2} GB";
