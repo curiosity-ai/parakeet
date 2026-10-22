@@ -150,7 +150,9 @@ public sealed unsafe class ConformerEncoder : IDisposable
         int t = _cfg.EncoderFrames(melFrames), d = _cfg.DModel, ff = _cfg.FfHidden;
         float eps = _cfg.LayerNormEps;
         float* x = output;     // the residual stream lives in the output buffer
+        Profiler.Start();
         _sub.Forward(features, melFrames, x, ws.Sub.Ptr, par);
+        Profiler.Mark("subsampling");
         if (_cfg.XScaling)
         {
             float xs = MathF.Sqrt(d);
@@ -158,6 +160,7 @@ public sealed unsafe class ConformerEncoder : IDisposable
         }
         trace?.Invoke("pre_encode", x, t, d);
         RelPositionAttention.PositionalEncoding(t, d, ws.PosEmb.Ptr);
+        Profiler.Mark("pos_enc");
         trace?.Invoke("pos_emb", ws.PosEmb.Ptr, 2 * t - 1, d);
 
         float* h = ws.Norm.Ptr, big = ws.Big.Ptr, ctx = ws.Ctx.Ptr, pp = ws.P.Ptr;
@@ -168,15 +171,21 @@ public sealed unsafe class ConformerEncoder : IDisposable
 
             // ½ · FF1
             Ops.LayerNorm(x, h, t, d, L.NormFf1G.Ptr, L.NormFf1B.Ptr, eps, par);
+            Profiler.Mark("layernorm");
             if (tr0) trace!("layer0.norm_ff1", h, t, d);
+            Profiler.Mark("trace");
             Gemm.Multiply(h, d, t, L.Ff1W1, big, ff, par, Ptr(L.Ff1B1), act: Activation.Silu);
             Gemm.Multiply(big, ff, t, L.Ff1W2, x, d, par, Ptr(L.Ff1B2), accumulate: true);
+            Profiler.Mark("ff gemm");
             if (tr0) trace!("layer0.ff1", x, t, d);
 
             // Relative-position multi-head self-attention
             Ops.LayerNorm(x, h, t, d, L.NormAttG.Ptr, L.NormAttB.Ptr, eps, par);
+            Profiler.Mark("layernorm");
             Gemm.Multiply(h, d, t, L.Qkv, big, 3 * d, par, Ptr(L.QkvB));
+            Profiler.Mark("qkv gemm");
             Gemm.Multiply(ws.PosEmb.Ptr, d, 2 * t - 1, L.Pos, pp, d, par);
+            Profiler.Mark("pos gemm");
             if (tr0)
             {
                 using var q = new NativeBuffer<float>((long)t * d, zero: false);
@@ -184,26 +193,38 @@ public sealed unsafe class ConformerEncoder : IDisposable
                 trace!("layer0.q", q.Ptr, t, d);
                 trace!("layer0.p", pp, 2 * t - 1, d);
             }
+            Profiler.Mark("trace");
             RelPositionAttention.Forward(big, pp, t, d, _cfg.Heads, L.BiasU.Ptr, L.BiasV.Ptr, ctx, ws.Attn.Ptr, par);
+            Profiler.Mark("attention");
             Gemm.Multiply(ctx, d, t, L.Out, x, d, par, Ptr(L.OutB), accumulate: true);
+            Profiler.Mark("out gemm");
             if (tr0) trace!("layer0.attn", x, t, d);
 
             // Convolution module: pointwise → GLU → depthwise (+BN) → SiLU → pointwise
             Ops.LayerNorm(x, h, t, d, L.NormConvG.Ptr, L.NormConvB.Ptr, eps, par);
+            Profiler.Mark("layernorm");
             Gemm.Multiply(h, d, t, L.Pw1, big, 2 * d, par, Ptr(L.Pw1B));
+            Profiler.Mark("conv gemm");
             Ops.Glu(big, ctx, t, d, par);
+            Profiler.Mark("glu");
             if (tr0) trace!("layer0.glu", ctx, t, d);
+            Profiler.Mark("trace");
             Ops.DepthwiseConv1d(ctx, h, t, d, L.DwW.Ptr, _cfg.ConvKernel, L.DwB.Ptr, silu: true, par);
+            Profiler.Mark("depthwise");
             Gemm.Multiply(h, d, t, L.Pw2, x, d, par, Ptr(L.Pw2B), accumulate: true);
+            Profiler.Mark("conv gemm");
             if (tr0) trace!("layer0.conv", x, t, d);
 
             // ½ · FF2
             Ops.LayerNorm(x, h, t, d, L.NormFf2G.Ptr, L.NormFf2B.Ptr, eps, par);
+            Profiler.Mark("layernorm");
             Gemm.Multiply(h, d, t, L.Ff2W1, big, ff, par, Ptr(L.Ff2B1), act: Activation.Silu);
             Gemm.Multiply(big, ff, t, L.Ff2W2, x, d, par, Ptr(L.Ff2B2), accumulate: true);
+            Profiler.Mark("ff gemm");
             if (tr0) trace!("layer0.ff2", x, t, d);
 
             Ops.LayerNorm(x, x, t, d, L.NormOutG.Ptr, L.NormOutB.Ptr, eps, par);
+            Profiler.Mark("layernorm");
             trace?.Invoke($"layer{li}", x, t, d);
         }
     }

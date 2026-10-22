@@ -22,19 +22,20 @@ public static unsafe class Gemm
 {
     private const int InitZero = 0, InitLoad = 1, InitBias = 2, InitLoadBias = 3;
     private const int NR = PackedMatrix.NR;
-    private const int KC = 256;
-    private const int NC = 16 * NR;
+    private static readonly int KC = PackedMatrix.KBlock;
+    private static readonly int PrefetchDistance = int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_PF"), out int pf) ? pf : 1024;
+    private static readonly int NC = (int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_NCP"), out int ncp) ? ncp : 16) * NR;
 
     internal static readonly bool UseAvx512 = Avx512F.IsSupported;
     internal static readonly bool UseAvx2 = !UseAvx512 && Avx2.IsSupported && Fma.IsSupported;
     internal static readonly int MR = UseAvx512 ? 12 : UseAvx2 ? 2 : 1;
-    private static readonly int MC = MR * 20;
+    private static readonly int MC = MR * (int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_MCT"), out int mct) ? mct : 40);
 
     [ThreadStatic] private static Scratch? t_scratch;
+    [ThreadStatic] private static NativeBuffer<float>? t_aPack;
 
     private sealed class Scratch
     {
-        public readonly NativeBuffer<float> APack = new((long)MC * KC);
         public readonly NativeBuffer<float> CTile = new((long)MR * NR);
         public readonly NativeBuffer<float> Bias = new(NC);
     }
@@ -60,19 +61,49 @@ public static unsafe class Gemm
             SmallM(a, lda, m, b, nb0, nb1, cBase, ldc, par, bias, accumulate, act);
             return;
         }
+        int K = b.K;
+        int tiles = (m + MR - 1) / MR;
+        // A is packed once per call (shared by every work item) into MR-row micro-panels, k-block-major:
+        // block kb holds [tile][kc][MR] for all tiles, so a tile's k-block is one contiguous, sequential read.
+        long aSize = (long)tiles * MR * K;
+        var aBuf = t_aPack;
+        if (aBuf == null || aBuf.Length < aSize)
+        {
+            aBuf?.Dispose();
+            aBuf = t_aPack = new NativeBuffer<float>(Math.Max(aSize, 1 << 16), zero: false);
+        }
+        float* aPack = aBuf.Ptr;
+        int kBlocks = (K + KC - 1) / KC;
+        if (par.MaxThreads == 1 || (long)m * K < (1 << 16))
+        {
+            for (int kb = 0; kb < kBlocks; kb++) PackA(a, lda, m, K, kb, 0, tiles, aPack);
+        }
+        else
+        {
+            int tileChunks = Math.Max(1, Math.Min(tiles, (par.MaxThreads * 4 + kBlocks - 1) / kBlocks));
+            par.For(kBlocks * tileChunks, item =>
+            {
+                int kb = item / tileChunks, ch = item % tileChunks;
+                PackA(a, lda, m, K, kb, ch * tiles / tileChunks, (ch + 1) * tiles / tileChunks, aPack);
+            });
+        }
+
         int blocks = nb1 - nb0;
         int mChunks = (m + MC - 1) / MC;
         int nGroups = 1;
-        if (par.MaxThreads > 1)
+        if (par.MaxThreads > 1 && mChunks < 2 * par.MaxThreads)
         {
-            int target = par.MaxThreads * 3;
-            nGroups = Math.Clamp((target + mChunks - 1) / mChunks, 1, Math.Max(1, blocks / 4));
-            if (mChunks >= target) nGroups = 1;
+            // About two items per thread, preferring a group count that splits the panels evenly: with only a few
+            // panels per item, an uneven split (2 vs 3 panels) costs up to a third of the run time.
+            int want = Math.Max(1, (2 * par.MaxThreads + mChunks - 1) / mChunks);
+            nGroups = Math.Min(blocks, want);
+            for (int g = want; g <= Math.Min(blocks, 2 * want); g++)
+                if (blocks % g == 0 && (g * mChunks) % par.MaxThreads == 0) { nGroups = g; break; }
         }
         int items = mChunks * nGroups;
         if (items == 1)
         {
-            Block(a, lda, 0, m, b, nb0, nb1, cBase, ldc, bias, accumulate, act);
+            Block(aPack, tiles, 0, m, b, nb0, nb1, cBase, ldc, bias, accumulate, act);
             return;
         }
         par.For(items, item =>
@@ -80,25 +111,24 @@ public static unsafe class Gemm
             int mc = item / nGroups, g = item % nGroups;
             int g0 = nb0 + (int)((long)g * blocks / nGroups), g1 = nb0 + (int)((long)(g + 1) * blocks / nGroups);
             int m0 = mc * MC, m1 = Math.Min(m, m0 + MC);
-            Block(a, lda, m0, m1, b, g0, g1, cBase, ldc, bias, accumulate, act);
+            Block(aPack, tiles, m0, m1, b, g0, g1, cBase, ldc, bias, accumulate, act);
         });
     }
 
-    private static void Block(float* a, long lda, int m0, int m1, PackedMatrix b, int nb0, int nb1, float* c, long ldc,
+    private static void Block(float* aPack, int tilesTotal, int m0, int m1, PackedMatrix b, int nb0, int nb1, float* c, long ldc,
                               float* bias, bool accumulate, Activation act)
     {
         var s = t_scratch ??= new Scratch();
-        float* aPack = s.APack.Ptr, cTile = s.CTile.Ptr, biasTile = s.Bias.Ptr;
+        float* cTile = s.CTile.Ptr, biasTile = s.Bias.Ptr;
         int K = b.K, N = b.N;
-        int rows = m1 - m0;
-        int tiles = (rows + MR - 1) / MR;
-        const int panelsPerBlock = NC / NR;
+        int t0 = m0 / MR, t1 = (m1 + MR - 1) / MR;
+        int panelsPerBlock = NC / NR;
         for (int k0 = 0; k0 < K; k0 += KC)
         {
             int kc = Math.Min(KC, K - k0);
             bool last = k0 + kc >= K;
             Activation tileAct = last ? act : Activation.None;
-            PackA(a + (long)m0 * lda + k0, lda, rows, kc, aPack);
+            float* aBlock = aPack + (long)k0 * tilesTotal * MR;
             int mode = k0 > 0 ? InitLoad : accumulate ? (bias != null ? InitLoadBias : InitLoad) : bias != null ? InitBias : InitZero;
             for (int nbBlock = nb0; nbBlock < nb1; nbBlock += panelsPerBlock)
             {
@@ -111,20 +141,47 @@ public static unsafe class Gemm
                         biasTile[j] = col < N ? bias[col] : 0f;
                     }
                 }
-                for (int t = 0; t < tiles; t++)
+                // The next B block (next panels of this k-block, else the first ones of the next k-block) is streamed
+                // into L2 a slice at a time during this block's tile passes, so DRAM latency overlaps the FMAs.
+                byte* pfNext = null;
+                long pfBytes = 0;
+                if (nbEnd < nb1)
                 {
-                    int r0 = m0 + t * MR;
+                    pfNext = (byte*)b.Panel(nbEnd, k0);
+                    pfBytes = (long)(Math.Min(nb1, nbEnd + panelsPerBlock) - nbEnd) * kc * NR * sizeof(float);
+                }
+                else if (k0 + kc < K)
+                {
+                    int kc2 = Math.Min(KC, K - k0 - kc);
+                    pfNext = (byte*)b.Panel(nb0, k0 + kc);
+                    pfBytes = (long)(Math.Min(nb1, nb0 + panelsPerBlock) - nb0) * kc2 * NR * sizeof(float);
+                }
+                int calls = (t1 - t0) * (nbEnd - nbBlock);
+                long pfPerCall = calls > 0 ? (pfBytes / 64 + calls - 1) / calls * 64 : 0;
+                long pfDone = 0;
+                for (int t = t0; t < t1; t++)
+                {
+                    int r0 = t * MR;
                     int tr = Math.Min(MR, m1 - r0);
-                    float* ap = aPack + (long)t * kc * MR;
+                    float* ap = aBlock + (long)t * kc * MR;
                     for (int nb = nbBlock; nb < nbEnd; nb++)
                     {
-                        float* panel = b.Data + ((long)nb * K + k0) * NR;
+                        if (pfDone < pfBytes)
+                        {
+                            long end = Math.Min(pfBytes, pfDone + pfPerCall);
+                            for (; pfDone < end; pfDone += 64) Sse.Prefetch1(pfNext + pfDone);
+                        }
+                        float* panel = b.Panel(nb, k0);
                         float* bp = biasTile + (nb - nbBlock) * NR;
                         int cols = Math.Min(NR, N - nb * NR);
                         float* cp = c + (long)r0 * ldc + nb * NR;
                         if (tr == MR && cols == NR)
                         {
                             Kernel(ap, panel, kc, cp, ldc, mode, bp, tileAct);
+                        }
+                        else if (cols == NR && UseAvx512)
+                        {
+                            Kernel512Rows(tr, ap, panel, kc, cp, ldc, mode, bp, tileAct);
                         }
                         else
                         {
@@ -144,20 +201,21 @@ public static unsafe class Gemm
         }
     }
 
-    /// <summary>Packs <paramref name="rows"/> × <paramref name="kc"/> of A into MR-row micro-panels laid out
-    /// [tile][k][MR] (zero-padded), so the kernel's broadcasts are sequential loads.</summary>
-    private static void PackA(float* a, long lda, int rows, int kc, float* dst)
+    /// <summary>Packs k-block <paramref name="kb"/> of tiles [<paramref name="t0"/>, <paramref name="t1"/>) of A into
+    /// MR-row micro-panels laid out [tile][k][MR] (zero-padded), so the kernel's broadcasts are sequential loads.</summary>
+    private static void PackA(float* a, long lda, int m, int K, int kb, int t0, int t1, float* dst)
     {
-        int tiles = (rows + MR - 1) / MR;
-        for (int t = 0; t < tiles; t++)
+        int tiles = (m + MR - 1) / MR;
+        int k0 = kb * KC, kc = Math.Min(KC, K - k0);
+        for (int t = t0; t < t1; t++)
         {
-            float* d = dst + (long)t * kc * MR;
+            float* d = dst + (long)k0 * tiles * MR + (long)t * kc * MR;
             int r0 = t * MR;
-            int tr = Math.Min(MR, rows - r0);
+            int tr = Math.Min(MR, m - r0);
             if (tr < MR) new Span<float>(d, kc * MR).Clear();
             for (int i = 0; i < tr; i++)
             {
-                float* src = a + (r0 + i) * lda;
+                float* src = a + (r0 + i) * lda + k0;
                 float* di = d + i;
                 int p = 0;
                 for (; p <= kc - 4; p += 4)
@@ -175,13 +233,969 @@ public static unsafe class Gemm
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Kernel(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
     {
-        if (UseAvx512) Kernel512(a, b, kc, c, ldc, mode, bias, act);
+        if (UseAvx512) Kernel512R12(a, b, kc, c, ldc, mode, bias, act);
         else if (UseAvx2) Kernel256(a, b, kc, c, ldc, mode, bias, act);
         else KernelScalar(a, b, kc, c, ldc, mode, bias, act);
     }
 
+    /// <summary>Dispatches the AVX-512 micro-kernel for a tile of <paramref name="rows"/> (1-12) rows × 32 columns.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Kernel512Rows(int rows, float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        switch (rows)
+        {
+            case 1: Kernel512R1(a, b, kc, c, ldc, mode, bias, act); break;
+            case 2: Kernel512R2(a, b, kc, c, ldc, mode, bias, act); break;
+            case 3: Kernel512R3(a, b, kc, c, ldc, mode, bias, act); break;
+            case 4: Kernel512R4(a, b, kc, c, ldc, mode, bias, act); break;
+            case 5: Kernel512R5(a, b, kc, c, ldc, mode, bias, act); break;
+            case 6: Kernel512R6(a, b, kc, c, ldc, mode, bias, act); break;
+            case 7: Kernel512R7(a, b, kc, c, ldc, mode, bias, act); break;
+            case 8: Kernel512R8(a, b, kc, c, ldc, mode, bias, act); break;
+            case 9: Kernel512R9(a, b, kc, c, ldc, mode, bias, act); break;
+            case 10: Kernel512R10(a, b, kc, c, ldc, mode, bias, act); break;
+            case 11: Kernel512R11(a, b, kc, c, ldc, mode, bias, act); break;
+            case 12: Kernel512R12(a, b, kc, c, ldc, mode, bias, act); break;
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void Kernel512(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    private static void Kernel512R1(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R2(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R3(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R4(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+            c3a = Vector512<float>.Zero; c3b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+            c3a = ba; c3b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            c3a = Vector512.Load(c + 3 * ldc); c3b = Vector512.Load(c + 3 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+                c3a += ba; c3b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            { var x = Vector512.Create(a[3]); c3a = Avx512F.FusedMultiplyAdd(x, b0, c3a); c3b = Avx512F.FusedMultiplyAdd(x, b1, c3b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+            c3a = VMath.Silu(c3a); c3b = VMath.Silu(c3b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+            c3a = Vector512.Max(c3a, z); c3b = Vector512.Max(c3b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+        Vector512.Store(c3a, c + 3 * ldc); Vector512.Store(c3b, c + 3 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R5(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b, c4a, c4b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+            c3a = Vector512<float>.Zero; c3b = Vector512<float>.Zero;
+            c4a = Vector512<float>.Zero; c4b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+            c3a = ba; c3b = bb;
+            c4a = ba; c4b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            c3a = Vector512.Load(c + 3 * ldc); c3b = Vector512.Load(c + 3 * ldc + 16);
+            c4a = Vector512.Load(c + 4 * ldc); c4b = Vector512.Load(c + 4 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+                c3a += ba; c3b += bb;
+                c4a += ba; c4b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            { var x = Vector512.Create(a[3]); c3a = Avx512F.FusedMultiplyAdd(x, b0, c3a); c3b = Avx512F.FusedMultiplyAdd(x, b1, c3b); }
+            { var x = Vector512.Create(a[4]); c4a = Avx512F.FusedMultiplyAdd(x, b0, c4a); c4b = Avx512F.FusedMultiplyAdd(x, b1, c4b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+            c3a = VMath.Silu(c3a); c3b = VMath.Silu(c3b);
+            c4a = VMath.Silu(c4a); c4b = VMath.Silu(c4b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+            c3a = Vector512.Max(c3a, z); c3b = Vector512.Max(c3b, z);
+            c4a = Vector512.Max(c4a, z); c4b = Vector512.Max(c4b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+        Vector512.Store(c3a, c + 3 * ldc); Vector512.Store(c3b, c + 3 * ldc + 16);
+        Vector512.Store(c4a, c + 4 * ldc); Vector512.Store(c4b, c + 4 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R6(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b, c4a, c4b, c5a, c5b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+            c3a = Vector512<float>.Zero; c3b = Vector512<float>.Zero;
+            c4a = Vector512<float>.Zero; c4b = Vector512<float>.Zero;
+            c5a = Vector512<float>.Zero; c5b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+            c3a = ba; c3b = bb;
+            c4a = ba; c4b = bb;
+            c5a = ba; c5b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            c3a = Vector512.Load(c + 3 * ldc); c3b = Vector512.Load(c + 3 * ldc + 16);
+            c4a = Vector512.Load(c + 4 * ldc); c4b = Vector512.Load(c + 4 * ldc + 16);
+            c5a = Vector512.Load(c + 5 * ldc); c5b = Vector512.Load(c + 5 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+                c3a += ba; c3b += bb;
+                c4a += ba; c4b += bb;
+                c5a += ba; c5b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            { var x = Vector512.Create(a[3]); c3a = Avx512F.FusedMultiplyAdd(x, b0, c3a); c3b = Avx512F.FusedMultiplyAdd(x, b1, c3b); }
+            { var x = Vector512.Create(a[4]); c4a = Avx512F.FusedMultiplyAdd(x, b0, c4a); c4b = Avx512F.FusedMultiplyAdd(x, b1, c4b); }
+            { var x = Vector512.Create(a[5]); c5a = Avx512F.FusedMultiplyAdd(x, b0, c5a); c5b = Avx512F.FusedMultiplyAdd(x, b1, c5b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+            c3a = VMath.Silu(c3a); c3b = VMath.Silu(c3b);
+            c4a = VMath.Silu(c4a); c4b = VMath.Silu(c4b);
+            c5a = VMath.Silu(c5a); c5b = VMath.Silu(c5b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+            c3a = Vector512.Max(c3a, z); c3b = Vector512.Max(c3b, z);
+            c4a = Vector512.Max(c4a, z); c4b = Vector512.Max(c4b, z);
+            c5a = Vector512.Max(c5a, z); c5b = Vector512.Max(c5b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+        Vector512.Store(c3a, c + 3 * ldc); Vector512.Store(c3b, c + 3 * ldc + 16);
+        Vector512.Store(c4a, c + 4 * ldc); Vector512.Store(c4b, c + 4 * ldc + 16);
+        Vector512.Store(c5a, c + 5 * ldc); Vector512.Store(c5b, c + 5 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R7(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b, c4a, c4b, c5a, c5b, c6a, c6b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+            c3a = Vector512<float>.Zero; c3b = Vector512<float>.Zero;
+            c4a = Vector512<float>.Zero; c4b = Vector512<float>.Zero;
+            c5a = Vector512<float>.Zero; c5b = Vector512<float>.Zero;
+            c6a = Vector512<float>.Zero; c6b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+            c3a = ba; c3b = bb;
+            c4a = ba; c4b = bb;
+            c5a = ba; c5b = bb;
+            c6a = ba; c6b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            c3a = Vector512.Load(c + 3 * ldc); c3b = Vector512.Load(c + 3 * ldc + 16);
+            c4a = Vector512.Load(c + 4 * ldc); c4b = Vector512.Load(c + 4 * ldc + 16);
+            c5a = Vector512.Load(c + 5 * ldc); c5b = Vector512.Load(c + 5 * ldc + 16);
+            c6a = Vector512.Load(c + 6 * ldc); c6b = Vector512.Load(c + 6 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+                c3a += ba; c3b += bb;
+                c4a += ba; c4b += bb;
+                c5a += ba; c5b += bb;
+                c6a += ba; c6b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            { var x = Vector512.Create(a[3]); c3a = Avx512F.FusedMultiplyAdd(x, b0, c3a); c3b = Avx512F.FusedMultiplyAdd(x, b1, c3b); }
+            { var x = Vector512.Create(a[4]); c4a = Avx512F.FusedMultiplyAdd(x, b0, c4a); c4b = Avx512F.FusedMultiplyAdd(x, b1, c4b); }
+            { var x = Vector512.Create(a[5]); c5a = Avx512F.FusedMultiplyAdd(x, b0, c5a); c5b = Avx512F.FusedMultiplyAdd(x, b1, c5b); }
+            { var x = Vector512.Create(a[6]); c6a = Avx512F.FusedMultiplyAdd(x, b0, c6a); c6b = Avx512F.FusedMultiplyAdd(x, b1, c6b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+            c3a = VMath.Silu(c3a); c3b = VMath.Silu(c3b);
+            c4a = VMath.Silu(c4a); c4b = VMath.Silu(c4b);
+            c5a = VMath.Silu(c5a); c5b = VMath.Silu(c5b);
+            c6a = VMath.Silu(c6a); c6b = VMath.Silu(c6b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+            c3a = Vector512.Max(c3a, z); c3b = Vector512.Max(c3b, z);
+            c4a = Vector512.Max(c4a, z); c4b = Vector512.Max(c4b, z);
+            c5a = Vector512.Max(c5a, z); c5b = Vector512.Max(c5b, z);
+            c6a = Vector512.Max(c6a, z); c6b = Vector512.Max(c6b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+        Vector512.Store(c3a, c + 3 * ldc); Vector512.Store(c3b, c + 3 * ldc + 16);
+        Vector512.Store(c4a, c + 4 * ldc); Vector512.Store(c4b, c + 4 * ldc + 16);
+        Vector512.Store(c5a, c + 5 * ldc); Vector512.Store(c5b, c + 5 * ldc + 16);
+        Vector512.Store(c6a, c + 6 * ldc); Vector512.Store(c6b, c + 6 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R8(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b, c4a, c4b, c5a, c5b, c6a, c6b, c7a, c7b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+            c3a = Vector512<float>.Zero; c3b = Vector512<float>.Zero;
+            c4a = Vector512<float>.Zero; c4b = Vector512<float>.Zero;
+            c5a = Vector512<float>.Zero; c5b = Vector512<float>.Zero;
+            c6a = Vector512<float>.Zero; c6b = Vector512<float>.Zero;
+            c7a = Vector512<float>.Zero; c7b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+            c3a = ba; c3b = bb;
+            c4a = ba; c4b = bb;
+            c5a = ba; c5b = bb;
+            c6a = ba; c6b = bb;
+            c7a = ba; c7b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            c3a = Vector512.Load(c + 3 * ldc); c3b = Vector512.Load(c + 3 * ldc + 16);
+            c4a = Vector512.Load(c + 4 * ldc); c4b = Vector512.Load(c + 4 * ldc + 16);
+            c5a = Vector512.Load(c + 5 * ldc); c5b = Vector512.Load(c + 5 * ldc + 16);
+            c6a = Vector512.Load(c + 6 * ldc); c6b = Vector512.Load(c + 6 * ldc + 16);
+            c7a = Vector512.Load(c + 7 * ldc); c7b = Vector512.Load(c + 7 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+                c3a += ba; c3b += bb;
+                c4a += ba; c4b += bb;
+                c5a += ba; c5b += bb;
+                c6a += ba; c6b += bb;
+                c7a += ba; c7b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            { var x = Vector512.Create(a[3]); c3a = Avx512F.FusedMultiplyAdd(x, b0, c3a); c3b = Avx512F.FusedMultiplyAdd(x, b1, c3b); }
+            { var x = Vector512.Create(a[4]); c4a = Avx512F.FusedMultiplyAdd(x, b0, c4a); c4b = Avx512F.FusedMultiplyAdd(x, b1, c4b); }
+            { var x = Vector512.Create(a[5]); c5a = Avx512F.FusedMultiplyAdd(x, b0, c5a); c5b = Avx512F.FusedMultiplyAdd(x, b1, c5b); }
+            { var x = Vector512.Create(a[6]); c6a = Avx512F.FusedMultiplyAdd(x, b0, c6a); c6b = Avx512F.FusedMultiplyAdd(x, b1, c6b); }
+            { var x = Vector512.Create(a[7]); c7a = Avx512F.FusedMultiplyAdd(x, b0, c7a); c7b = Avx512F.FusedMultiplyAdd(x, b1, c7b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+            c3a = VMath.Silu(c3a); c3b = VMath.Silu(c3b);
+            c4a = VMath.Silu(c4a); c4b = VMath.Silu(c4b);
+            c5a = VMath.Silu(c5a); c5b = VMath.Silu(c5b);
+            c6a = VMath.Silu(c6a); c6b = VMath.Silu(c6b);
+            c7a = VMath.Silu(c7a); c7b = VMath.Silu(c7b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+            c3a = Vector512.Max(c3a, z); c3b = Vector512.Max(c3b, z);
+            c4a = Vector512.Max(c4a, z); c4b = Vector512.Max(c4b, z);
+            c5a = Vector512.Max(c5a, z); c5b = Vector512.Max(c5b, z);
+            c6a = Vector512.Max(c6a, z); c6b = Vector512.Max(c6b, z);
+            c7a = Vector512.Max(c7a, z); c7b = Vector512.Max(c7b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+        Vector512.Store(c3a, c + 3 * ldc); Vector512.Store(c3b, c + 3 * ldc + 16);
+        Vector512.Store(c4a, c + 4 * ldc); Vector512.Store(c4b, c + 4 * ldc + 16);
+        Vector512.Store(c5a, c + 5 * ldc); Vector512.Store(c5b, c + 5 * ldc + 16);
+        Vector512.Store(c6a, c + 6 * ldc); Vector512.Store(c6b, c + 6 * ldc + 16);
+        Vector512.Store(c7a, c + 7 * ldc); Vector512.Store(c7b, c + 7 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R9(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b, c4a, c4b, c5a, c5b, c6a, c6b, c7a, c7b, c8a, c8b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+            c3a = Vector512<float>.Zero; c3b = Vector512<float>.Zero;
+            c4a = Vector512<float>.Zero; c4b = Vector512<float>.Zero;
+            c5a = Vector512<float>.Zero; c5b = Vector512<float>.Zero;
+            c6a = Vector512<float>.Zero; c6b = Vector512<float>.Zero;
+            c7a = Vector512<float>.Zero; c7b = Vector512<float>.Zero;
+            c8a = Vector512<float>.Zero; c8b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+            c3a = ba; c3b = bb;
+            c4a = ba; c4b = bb;
+            c5a = ba; c5b = bb;
+            c6a = ba; c6b = bb;
+            c7a = ba; c7b = bb;
+            c8a = ba; c8b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            c3a = Vector512.Load(c + 3 * ldc); c3b = Vector512.Load(c + 3 * ldc + 16);
+            c4a = Vector512.Load(c + 4 * ldc); c4b = Vector512.Load(c + 4 * ldc + 16);
+            c5a = Vector512.Load(c + 5 * ldc); c5b = Vector512.Load(c + 5 * ldc + 16);
+            c6a = Vector512.Load(c + 6 * ldc); c6b = Vector512.Load(c + 6 * ldc + 16);
+            c7a = Vector512.Load(c + 7 * ldc); c7b = Vector512.Load(c + 7 * ldc + 16);
+            c8a = Vector512.Load(c + 8 * ldc); c8b = Vector512.Load(c + 8 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+                c3a += ba; c3b += bb;
+                c4a += ba; c4b += bb;
+                c5a += ba; c5b += bb;
+                c6a += ba; c6b += bb;
+                c7a += ba; c7b += bb;
+                c8a += ba; c8b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            { var x = Vector512.Create(a[3]); c3a = Avx512F.FusedMultiplyAdd(x, b0, c3a); c3b = Avx512F.FusedMultiplyAdd(x, b1, c3b); }
+            { var x = Vector512.Create(a[4]); c4a = Avx512F.FusedMultiplyAdd(x, b0, c4a); c4b = Avx512F.FusedMultiplyAdd(x, b1, c4b); }
+            { var x = Vector512.Create(a[5]); c5a = Avx512F.FusedMultiplyAdd(x, b0, c5a); c5b = Avx512F.FusedMultiplyAdd(x, b1, c5b); }
+            { var x = Vector512.Create(a[6]); c6a = Avx512F.FusedMultiplyAdd(x, b0, c6a); c6b = Avx512F.FusedMultiplyAdd(x, b1, c6b); }
+            { var x = Vector512.Create(a[7]); c7a = Avx512F.FusedMultiplyAdd(x, b0, c7a); c7b = Avx512F.FusedMultiplyAdd(x, b1, c7b); }
+            { var x = Vector512.Create(a[8]); c8a = Avx512F.FusedMultiplyAdd(x, b0, c8a); c8b = Avx512F.FusedMultiplyAdd(x, b1, c8b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+            c3a = VMath.Silu(c3a); c3b = VMath.Silu(c3b);
+            c4a = VMath.Silu(c4a); c4b = VMath.Silu(c4b);
+            c5a = VMath.Silu(c5a); c5b = VMath.Silu(c5b);
+            c6a = VMath.Silu(c6a); c6b = VMath.Silu(c6b);
+            c7a = VMath.Silu(c7a); c7b = VMath.Silu(c7b);
+            c8a = VMath.Silu(c8a); c8b = VMath.Silu(c8b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+            c3a = Vector512.Max(c3a, z); c3b = Vector512.Max(c3b, z);
+            c4a = Vector512.Max(c4a, z); c4b = Vector512.Max(c4b, z);
+            c5a = Vector512.Max(c5a, z); c5b = Vector512.Max(c5b, z);
+            c6a = Vector512.Max(c6a, z); c6b = Vector512.Max(c6b, z);
+            c7a = Vector512.Max(c7a, z); c7b = Vector512.Max(c7b, z);
+            c8a = Vector512.Max(c8a, z); c8b = Vector512.Max(c8b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+        Vector512.Store(c3a, c + 3 * ldc); Vector512.Store(c3b, c + 3 * ldc + 16);
+        Vector512.Store(c4a, c + 4 * ldc); Vector512.Store(c4b, c + 4 * ldc + 16);
+        Vector512.Store(c5a, c + 5 * ldc); Vector512.Store(c5b, c + 5 * ldc + 16);
+        Vector512.Store(c6a, c + 6 * ldc); Vector512.Store(c6b, c + 6 * ldc + 16);
+        Vector512.Store(c7a, c + 7 * ldc); Vector512.Store(c7b, c + 7 * ldc + 16);
+        Vector512.Store(c8a, c + 8 * ldc); Vector512.Store(c8b, c + 8 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R10(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b, c4a, c4b, c5a, c5b, c6a, c6b, c7a, c7b, c8a, c8b, c9a, c9b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+            c3a = Vector512<float>.Zero; c3b = Vector512<float>.Zero;
+            c4a = Vector512<float>.Zero; c4b = Vector512<float>.Zero;
+            c5a = Vector512<float>.Zero; c5b = Vector512<float>.Zero;
+            c6a = Vector512<float>.Zero; c6b = Vector512<float>.Zero;
+            c7a = Vector512<float>.Zero; c7b = Vector512<float>.Zero;
+            c8a = Vector512<float>.Zero; c8b = Vector512<float>.Zero;
+            c9a = Vector512<float>.Zero; c9b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+            c3a = ba; c3b = bb;
+            c4a = ba; c4b = bb;
+            c5a = ba; c5b = bb;
+            c6a = ba; c6b = bb;
+            c7a = ba; c7b = bb;
+            c8a = ba; c8b = bb;
+            c9a = ba; c9b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            c3a = Vector512.Load(c + 3 * ldc); c3b = Vector512.Load(c + 3 * ldc + 16);
+            c4a = Vector512.Load(c + 4 * ldc); c4b = Vector512.Load(c + 4 * ldc + 16);
+            c5a = Vector512.Load(c + 5 * ldc); c5b = Vector512.Load(c + 5 * ldc + 16);
+            c6a = Vector512.Load(c + 6 * ldc); c6b = Vector512.Load(c + 6 * ldc + 16);
+            c7a = Vector512.Load(c + 7 * ldc); c7b = Vector512.Load(c + 7 * ldc + 16);
+            c8a = Vector512.Load(c + 8 * ldc); c8b = Vector512.Load(c + 8 * ldc + 16);
+            c9a = Vector512.Load(c + 9 * ldc); c9b = Vector512.Load(c + 9 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+                c3a += ba; c3b += bb;
+                c4a += ba; c4b += bb;
+                c5a += ba; c5b += bb;
+                c6a += ba; c6b += bb;
+                c7a += ba; c7b += bb;
+                c8a += ba; c8b += bb;
+                c9a += ba; c9b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            { var x = Vector512.Create(a[3]); c3a = Avx512F.FusedMultiplyAdd(x, b0, c3a); c3b = Avx512F.FusedMultiplyAdd(x, b1, c3b); }
+            { var x = Vector512.Create(a[4]); c4a = Avx512F.FusedMultiplyAdd(x, b0, c4a); c4b = Avx512F.FusedMultiplyAdd(x, b1, c4b); }
+            { var x = Vector512.Create(a[5]); c5a = Avx512F.FusedMultiplyAdd(x, b0, c5a); c5b = Avx512F.FusedMultiplyAdd(x, b1, c5b); }
+            { var x = Vector512.Create(a[6]); c6a = Avx512F.FusedMultiplyAdd(x, b0, c6a); c6b = Avx512F.FusedMultiplyAdd(x, b1, c6b); }
+            { var x = Vector512.Create(a[7]); c7a = Avx512F.FusedMultiplyAdd(x, b0, c7a); c7b = Avx512F.FusedMultiplyAdd(x, b1, c7b); }
+            { var x = Vector512.Create(a[8]); c8a = Avx512F.FusedMultiplyAdd(x, b0, c8a); c8b = Avx512F.FusedMultiplyAdd(x, b1, c8b); }
+            { var x = Vector512.Create(a[9]); c9a = Avx512F.FusedMultiplyAdd(x, b0, c9a); c9b = Avx512F.FusedMultiplyAdd(x, b1, c9b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+            c3a = VMath.Silu(c3a); c3b = VMath.Silu(c3b);
+            c4a = VMath.Silu(c4a); c4b = VMath.Silu(c4b);
+            c5a = VMath.Silu(c5a); c5b = VMath.Silu(c5b);
+            c6a = VMath.Silu(c6a); c6b = VMath.Silu(c6b);
+            c7a = VMath.Silu(c7a); c7b = VMath.Silu(c7b);
+            c8a = VMath.Silu(c8a); c8b = VMath.Silu(c8b);
+            c9a = VMath.Silu(c9a); c9b = VMath.Silu(c9b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+            c3a = Vector512.Max(c3a, z); c3b = Vector512.Max(c3b, z);
+            c4a = Vector512.Max(c4a, z); c4b = Vector512.Max(c4b, z);
+            c5a = Vector512.Max(c5a, z); c5b = Vector512.Max(c5b, z);
+            c6a = Vector512.Max(c6a, z); c6b = Vector512.Max(c6b, z);
+            c7a = Vector512.Max(c7a, z); c7b = Vector512.Max(c7b, z);
+            c8a = Vector512.Max(c8a, z); c8b = Vector512.Max(c8b, z);
+            c9a = Vector512.Max(c9a, z); c9b = Vector512.Max(c9b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+        Vector512.Store(c3a, c + 3 * ldc); Vector512.Store(c3b, c + 3 * ldc + 16);
+        Vector512.Store(c4a, c + 4 * ldc); Vector512.Store(c4b, c + 4 * ldc + 16);
+        Vector512.Store(c5a, c + 5 * ldc); Vector512.Store(c5b, c + 5 * ldc + 16);
+        Vector512.Store(c6a, c + 6 * ldc); Vector512.Store(c6b, c + 6 * ldc + 16);
+        Vector512.Store(c7a, c + 7 * ldc); Vector512.Store(c7b, c + 7 * ldc + 16);
+        Vector512.Store(c8a, c + 8 * ldc); Vector512.Store(c8b, c + 8 * ldc + 16);
+        Vector512.Store(c9a, c + 9 * ldc); Vector512.Store(c9b, c + 9 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R11(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
+    {
+        Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b, c4a, c4b, c5a, c5b, c6a, c6b, c7a, c7b, c8a, c8b, c9a, c9b, c10a, c10b;
+        if (mode == InitZero)
+        {
+            c0a = Vector512<float>.Zero; c0b = Vector512<float>.Zero;
+            c1a = Vector512<float>.Zero; c1b = Vector512<float>.Zero;
+            c2a = Vector512<float>.Zero; c2b = Vector512<float>.Zero;
+            c3a = Vector512<float>.Zero; c3b = Vector512<float>.Zero;
+            c4a = Vector512<float>.Zero; c4b = Vector512<float>.Zero;
+            c5a = Vector512<float>.Zero; c5b = Vector512<float>.Zero;
+            c6a = Vector512<float>.Zero; c6b = Vector512<float>.Zero;
+            c7a = Vector512<float>.Zero; c7b = Vector512<float>.Zero;
+            c8a = Vector512<float>.Zero; c8b = Vector512<float>.Zero;
+            c9a = Vector512<float>.Zero; c9b = Vector512<float>.Zero;
+            c10a = Vector512<float>.Zero; c10b = Vector512<float>.Zero;
+        }
+        else if (mode == InitBias)
+        {
+            var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+            c0a = ba; c0b = bb;
+            c1a = ba; c1b = bb;
+            c2a = ba; c2b = bb;
+            c3a = ba; c3b = bb;
+            c4a = ba; c4b = bb;
+            c5a = ba; c5b = bb;
+            c6a = ba; c6b = bb;
+            c7a = ba; c7b = bb;
+            c8a = ba; c8b = bb;
+            c9a = ba; c9b = bb;
+            c10a = ba; c10b = bb;
+        }
+        else
+        {
+            c0a = Vector512.Load(c + 0 * ldc); c0b = Vector512.Load(c + 0 * ldc + 16);
+            c1a = Vector512.Load(c + 1 * ldc); c1b = Vector512.Load(c + 1 * ldc + 16);
+            c2a = Vector512.Load(c + 2 * ldc); c2b = Vector512.Load(c + 2 * ldc + 16);
+            c3a = Vector512.Load(c + 3 * ldc); c3b = Vector512.Load(c + 3 * ldc + 16);
+            c4a = Vector512.Load(c + 4 * ldc); c4b = Vector512.Load(c + 4 * ldc + 16);
+            c5a = Vector512.Load(c + 5 * ldc); c5b = Vector512.Load(c + 5 * ldc + 16);
+            c6a = Vector512.Load(c + 6 * ldc); c6b = Vector512.Load(c + 6 * ldc + 16);
+            c7a = Vector512.Load(c + 7 * ldc); c7b = Vector512.Load(c + 7 * ldc + 16);
+            c8a = Vector512.Load(c + 8 * ldc); c8b = Vector512.Load(c + 8 * ldc + 16);
+            c9a = Vector512.Load(c + 9 * ldc); c9b = Vector512.Load(c + 9 * ldc + 16);
+            c10a = Vector512.Load(c + 10 * ldc); c10b = Vector512.Load(c + 10 * ldc + 16);
+            if (mode == InitLoadBias)
+            {
+                var ba = Vector512.Load(bias); var bb = Vector512.Load(bias + 16);
+                c0a += ba; c0b += bb;
+                c1a += ba; c1b += bb;
+                c2a += ba; c2b += bb;
+                c3a += ba; c3b += bb;
+                c4a += ba; c4b += bb;
+                c5a += ba; c5b += bb;
+                c6a += ba; c6b += bb;
+                c7a += ba; c7b += bb;
+                c8a += ba; c8b += bb;
+                c9a += ba; c9b += bb;
+                c10a += ba; c10b += bb;
+            }
+        }
+        for (int p = 0; p < kc; p++)
+        {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
+            var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
+            { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
+            { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
+            { var x = Vector512.Create(a[2]); c2a = Avx512F.FusedMultiplyAdd(x, b0, c2a); c2b = Avx512F.FusedMultiplyAdd(x, b1, c2b); }
+            { var x = Vector512.Create(a[3]); c3a = Avx512F.FusedMultiplyAdd(x, b0, c3a); c3b = Avx512F.FusedMultiplyAdd(x, b1, c3b); }
+            { var x = Vector512.Create(a[4]); c4a = Avx512F.FusedMultiplyAdd(x, b0, c4a); c4b = Avx512F.FusedMultiplyAdd(x, b1, c4b); }
+            { var x = Vector512.Create(a[5]); c5a = Avx512F.FusedMultiplyAdd(x, b0, c5a); c5b = Avx512F.FusedMultiplyAdd(x, b1, c5b); }
+            { var x = Vector512.Create(a[6]); c6a = Avx512F.FusedMultiplyAdd(x, b0, c6a); c6b = Avx512F.FusedMultiplyAdd(x, b1, c6b); }
+            { var x = Vector512.Create(a[7]); c7a = Avx512F.FusedMultiplyAdd(x, b0, c7a); c7b = Avx512F.FusedMultiplyAdd(x, b1, c7b); }
+            { var x = Vector512.Create(a[8]); c8a = Avx512F.FusedMultiplyAdd(x, b0, c8a); c8b = Avx512F.FusedMultiplyAdd(x, b1, c8b); }
+            { var x = Vector512.Create(a[9]); c9a = Avx512F.FusedMultiplyAdd(x, b0, c9a); c9b = Avx512F.FusedMultiplyAdd(x, b1, c9b); }
+            { var x = Vector512.Create(a[10]); c10a = Avx512F.FusedMultiplyAdd(x, b0, c10a); c10b = Avx512F.FusedMultiplyAdd(x, b1, c10b); }
+            a += 12; b += 32;
+        }
+        if (act == Activation.Silu)
+        {
+            c0a = VMath.Silu(c0a); c0b = VMath.Silu(c0b);
+            c1a = VMath.Silu(c1a); c1b = VMath.Silu(c1b);
+            c2a = VMath.Silu(c2a); c2b = VMath.Silu(c2b);
+            c3a = VMath.Silu(c3a); c3b = VMath.Silu(c3b);
+            c4a = VMath.Silu(c4a); c4b = VMath.Silu(c4b);
+            c5a = VMath.Silu(c5a); c5b = VMath.Silu(c5b);
+            c6a = VMath.Silu(c6a); c6b = VMath.Silu(c6b);
+            c7a = VMath.Silu(c7a); c7b = VMath.Silu(c7b);
+            c8a = VMath.Silu(c8a); c8b = VMath.Silu(c8b);
+            c9a = VMath.Silu(c9a); c9b = VMath.Silu(c9b);
+            c10a = VMath.Silu(c10a); c10b = VMath.Silu(c10b);
+        }
+        else if (act == Activation.Relu)
+        {
+            var z = Vector512<float>.Zero;
+            c0a = Vector512.Max(c0a, z); c0b = Vector512.Max(c0b, z);
+            c1a = Vector512.Max(c1a, z); c1b = Vector512.Max(c1b, z);
+            c2a = Vector512.Max(c2a, z); c2b = Vector512.Max(c2b, z);
+            c3a = Vector512.Max(c3a, z); c3b = Vector512.Max(c3b, z);
+            c4a = Vector512.Max(c4a, z); c4b = Vector512.Max(c4b, z);
+            c5a = Vector512.Max(c5a, z); c5b = Vector512.Max(c5b, z);
+            c6a = Vector512.Max(c6a, z); c6b = Vector512.Max(c6b, z);
+            c7a = Vector512.Max(c7a, z); c7b = Vector512.Max(c7b, z);
+            c8a = Vector512.Max(c8a, z); c8b = Vector512.Max(c8b, z);
+            c9a = Vector512.Max(c9a, z); c9b = Vector512.Max(c9b, z);
+            c10a = Vector512.Max(c10a, z); c10b = Vector512.Max(c10b, z);
+        }
+        Vector512.Store(c0a, c + 0 * ldc); Vector512.Store(c0b, c + 0 * ldc + 16);
+        Vector512.Store(c1a, c + 1 * ldc); Vector512.Store(c1b, c + 1 * ldc + 16);
+        Vector512.Store(c2a, c + 2 * ldc); Vector512.Store(c2b, c + 2 * ldc + 16);
+        Vector512.Store(c3a, c + 3 * ldc); Vector512.Store(c3b, c + 3 * ldc + 16);
+        Vector512.Store(c4a, c + 4 * ldc); Vector512.Store(c4b, c + 4 * ldc + 16);
+        Vector512.Store(c5a, c + 5 * ldc); Vector512.Store(c5b, c + 5 * ldc + 16);
+        Vector512.Store(c6a, c + 6 * ldc); Vector512.Store(c6b, c + 6 * ldc + 16);
+        Vector512.Store(c7a, c + 7 * ldc); Vector512.Store(c7b, c + 7 * ldc + 16);
+        Vector512.Store(c8a, c + 8 * ldc); Vector512.Store(c8b, c + 8 * ldc + 16);
+        Vector512.Store(c9a, c + 9 * ldc); Vector512.Store(c9b, c + 9 * ldc + 16);
+        Vector512.Store(c10a, c + 10 * ldc); Vector512.Store(c10b, c + 10 * ldc + 16);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Kernel512R12(float* a, float* b, int kc, float* c, long ldc, int mode, float* bias, Activation act)
     {
         Vector512<float> c0a, c0b, c1a, c1b, c2a, c2b, c3a, c3b, c4a, c4b, c5a, c5b, c6a, c6b, c7a, c7b, c8a, c8b, c9a, c9b, c10a, c10b, c11a, c11b;
         if (mode == InitZero)
@@ -248,6 +1262,11 @@ public static unsafe class Gemm
         }
         for (int p = 0; p < kc; p++)
         {
+            if (PrefetchDistance > 0)
+            {
+                Sse.Prefetch0(b + PrefetchDistance);
+                Sse.Prefetch0(b + PrefetchDistance + 16);
+            }
             var b0 = Vector512.Load(b); var b1 = Vector512.Load(b + 16);
             { var x = Vector512.Create(a[0]); c0a = Avx512F.FusedMultiplyAdd(x, b0, c0a); c0b = Avx512F.FusedMultiplyAdd(x, b1, c0b); }
             { var x = Vector512.Create(a[1]); c1a = Avx512F.FusedMultiplyAdd(x, b0, c1a); c1b = Avx512F.FusedMultiplyAdd(x, b1, c1b); }
@@ -402,89 +1421,109 @@ public static unsafe class Gemm
         });
     }
 
+    [ThreadStatic] private static NativeBuffer<float>? t_smallAcc;
+
     private static void SmallMRange(float* a, long lda, int m, PackedMatrix b, int nb0, int nb1, float* c, long ldc,
                                     float* bias, bool accumulate, Activation act)
     {
-        int K = b.K, N = b.N;
-        float* tmp = stackalloc float[4 * NR];
-        for (int nb = nb0; nb < nb1; nb++)
+        int K = b.K, N = b.N, panels = nb1 - nb0;
+        // Partial sums for every (row, panel) of this range stay in L1/L2 while the weights stream past once,
+        // k-block by k-block in storage order.
+        long need = (long)m * panels * NR;
+        var accBuf = t_smallAcc;
+        if (accBuf == null || accBuf.Length < need)
         {
-            float* panel = b.Data + (long)nb * K * NR;
-            int cols = Math.Min(NR, N - nb * NR);
-            if (UseAvx512)
+            accBuf?.Dispose();
+            accBuf = t_smallAcc = new NativeBuffer<float>(Math.Max(need, 4096), zero: false);
+        }
+        float* acc = accBuf.Ptr;
+        new Span<float>(acc, (int)need).Clear();
+        for (int k0 = 0; k0 < K; k0 += KC)
+        {
+            int kc = Math.Min(KC, K - k0);
+            for (int nb = nb0; nb < nb1; nb++)
             {
-                // Two independent accumulator sets per row hide FMA latency for m = 1.
-                Vector512<float> r0a = default, r0b = default, r1a = default, r1b = default;
-                Vector512<float> r2a = default, r2b = default, r3a = default, r3b = default;
-                Vector512<float> s0a = default, s0b = default;
-                int p = 0;
-                if (m == 1)
+                float* panel = b.Panel(nb, k0);
+                float* ac = acc + (long)(nb - nb0) * m * NR;
+                if (UseAvx512)
                 {
-                    for (; p + 1 < K; p += 2)
+                    if (m == 1)
                     {
-                        float* bp = panel + (long)p * NR;
-                        var x0 = Vector512.Create(a[p]);
-                        var x1 = Vector512.Create(a[p + 1]);
-                        r0a = Avx512F.FusedMultiplyAdd(x0, Vector512.Load(bp), r0a);
-                        r0b = Avx512F.FusedMultiplyAdd(x0, Vector512.Load(bp + 16), r0b);
-                        s0a = Avx512F.FusedMultiplyAdd(x1, Vector512.Load(bp + 32), s0a);
-                        s0b = Avx512F.FusedMultiplyAdd(x1, Vector512.Load(bp + 48), s0b);
+                        var r0a = Vector512.Load(ac); var r0b = Vector512.Load(ac + 16);
+                        var s0a = Vector512<float>.Zero; var s0b = Vector512<float>.Zero;
+                        float* x = a + k0;
+                        int p = 0;
+                        for (; p + 1 < kc; p += 2)
+                        {
+                            float* bp = panel + p * NR;
+                            Sse.Prefetch0(bp + PrefetchDistance);
+                            Sse.Prefetch0(bp + PrefetchDistance + 32);
+                            var x0 = Vector512.Create(x[p]);
+                            var x1 = Vector512.Create(x[p + 1]);
+                            r0a = Avx512F.FusedMultiplyAdd(x0, Vector512.Load(bp), r0a);
+                            r0b = Avx512F.FusedMultiplyAdd(x0, Vector512.Load(bp + 16), r0b);
+                            s0a = Avx512F.FusedMultiplyAdd(x1, Vector512.Load(bp + 32), s0a);
+                            s0b = Avx512F.FusedMultiplyAdd(x1, Vector512.Load(bp + 48), s0b);
+                        }
+                        for (; p < kc; p++)
+                        {
+                            float* bp = panel + p * NR;
+                            var x0 = Vector512.Create(x[p]);
+                            r0a = Avx512F.FusedMultiplyAdd(x0, Vector512.Load(bp), r0a);
+                            r0b = Avx512F.FusedMultiplyAdd(x0, Vector512.Load(bp + 16), r0b);
+                        }
+                        Vector512.Store(r0a + s0a, ac);
+                        Vector512.Store(r0b + s0b, ac + 16);
                     }
-                    for (; p < K; p++)
+                    else
                     {
-                        float* bp = panel + (long)p * NR;
-                        var x0 = Vector512.Create(a[p]);
-                        r0a = Avx512F.FusedMultiplyAdd(x0, Vector512.Load(bp), r0a);
-                        r0b = Avx512F.FusedMultiplyAdd(x0, Vector512.Load(bp + 16), r0b);
+                        for (int r = 0; r < m; r += 2)
+                        {
+                            bool two = r + 1 < m;
+                            float* x0p = a + r * lda + k0, x1p = two ? x0p + lda : x0p;
+                            float* c0 = ac + r * NR, c1 = two ? c0 + NR : c0;
+                            var r0a = Vector512.Load(c0); var r0b = Vector512.Load(c0 + 16);
+                            var r1a = Vector512.Load(c1); var r1b = Vector512.Load(c1 + 16);
+                            for (int p = 0; p < kc; p++)
+                            {
+                                float* bp = panel + p * NR;
+                                var b0 = Vector512.Load(bp); var b1 = Vector512.Load(bp + 16);
+                                var x0 = Vector512.Create(x0p[p]);
+                                var x1 = Vector512.Create(x1p[p]);
+                                r0a = Avx512F.FusedMultiplyAdd(x0, b0, r0a); r0b = Avx512F.FusedMultiplyAdd(x0, b1, r0b);
+                                r1a = Avx512F.FusedMultiplyAdd(x1, b0, r1a); r1b = Avx512F.FusedMultiplyAdd(x1, b1, r1b);
+                            }
+                            if (two)
+                            {
+                                Vector512.Store(r1a, c1); Vector512.Store(r1b, c1 + 16);
+                            }
+                            Vector512.Store(r0a, c0); Vector512.Store(r0b, c0 + 16);
+                        }
                     }
-                    r0a += s0a;
-                    r0b += s0b;
                 }
                 else
                 {
-                    for (; p < K; p++)
-                    {
-                        float* bp = panel + (long)p * NR;
-                        var b0 = Vector512.Load(bp);
-                        var b1 = Vector512.Load(bp + 16);
-                        var x = Vector512.Create(a[p]);
-                        r0a = Avx512F.FusedMultiplyAdd(x, b0, r0a); r0b = Avx512F.FusedMultiplyAdd(x, b1, r0b);
-                        x = Vector512.Create(a[lda + p]);
-                        r1a = Avx512F.FusedMultiplyAdd(x, b0, r1a); r1b = Avx512F.FusedMultiplyAdd(x, b1, r1b);
-                        if (m > 2)
+                    for (int r = 0; r < m; r++)
+                        for (int p = 0; p < kc; p++)
                         {
-                            x = Vector512.Create(a[2 * lda + p]);
-                            r2a = Avx512F.FusedMultiplyAdd(x, b0, r2a); r2b = Avx512F.FusedMultiplyAdd(x, b1, r2b);
+                            float x = a[r * lda + k0 + p];
+                            float* bp = panel + p * NR;
+                            float* cr = ac + r * NR;
+                            for (int j = 0; j < NR; j++) cr[j] = MathF.FusedMultiplyAdd(x, bp[j], cr[j]);
                         }
-                        if (m > 3)
-                        {
-                            x = Vector512.Create(a[3 * lda + p]);
-                            r3a = Avx512F.FusedMultiplyAdd(x, b0, r3a); r3b = Avx512F.FusedMultiplyAdd(x, b1, r3b);
-                        }
-                    }
                 }
-                Vector512.Store(r0a, tmp); Vector512.Store(r0b, tmp + 16);
-                Vector512.Store(r1a, tmp + 32); Vector512.Store(r1b, tmp + 48);
-                Vector512.Store(r2a, tmp + 64); Vector512.Store(r2b, tmp + 80);
-                Vector512.Store(r3a, tmp + 96); Vector512.Store(r3b, tmp + 112);
             }
-            else
-            {
-                new Span<float>(tmp, 4 * NR).Clear();
-                for (int r = 0; r < m; r++)
-                    for (int p = 0; p < K; p++)
-                    {
-                        float x = a[r * lda + p];
-                        float* bp = panel + (long)p * NR;
-                        for (int j = 0; j < NR; j++) tmp[r * NR + j] = MathF.FusedMultiplyAdd(x, bp[j], tmp[r * NR + j]);
-                    }
-            }
+        }
+        for (int nb = nb0; nb < nb1; nb++)
+        {
+            int cols = Math.Min(NR, N - nb * NR);
+            float* ac = acc + (long)(nb - nb0) * m * NR;
             for (int r = 0; r < m; r++)
             {
                 float* cp = c + r * ldc + nb * NR;
                 for (int j = 0; j < cols; j++)
                 {
-                    float v = tmp[r * NR + j];
+                    float v = ac[r * NR + j];
                     if (bias != null) v += bias[nb * NR + j];
                     if (accumulate) v += cp[j];
                     cp[j] = Apply(v, act);

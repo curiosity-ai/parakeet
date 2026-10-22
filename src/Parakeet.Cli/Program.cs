@@ -78,11 +78,13 @@ switch (command)
         {
             var audio = WaveFile.ReadMono(f);
             asr.Transcribe(audio);
+            Parakeet.Numerics.Profiler.Reset();
             var all = Enumerable.Range(0, runs).Select(_ => asr.Transcribe(audio)).ToList();
             var best = all.MinBy(r => r.TotalTime)!;
             Console.WriteLine($"{Path.GetFileNameWithoutExtension(f)}: {best.AudioSeconds:F1}s audio  features {all.Min(r => r.FeatureTime.TotalMilliseconds):F0} ms  " +
                               $"encoder {all.Min(r => r.EncoderTime.TotalMilliseconds):F0} ms  decoder {all.Min(r => r.DecoderTime.TotalMilliseconds):F0} ms  " +
                               $"total {best.TotalTime.TotalMilliseconds:F0} ms  RTF {best.RealTimeFactor:F4}");
+            if (Parakeet.Numerics.Profiler.Enabled) Console.WriteLine(Parakeet.Numerics.Profiler.Report());
         }
         break;
     default:

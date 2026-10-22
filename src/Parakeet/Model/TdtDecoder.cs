@@ -46,8 +46,9 @@ public sealed unsafe class TdtDecoder : IDisposable
         using (var bias = new NativeBuffer<float>(g))
         {
             for (int i = 0; i < g; i++) bias.Ptr[i] = bih0[i] + bhh0[i];
+            using var par = new Parallelism(0);
             fixed (float* e = embed)
-                Gemm.Multiply(e, h, vocab, wPacked, _embedIn.Ptr, g, new Parallelism(0), bias.Ptr);
+                Gemm.Multiply(e, h, vocab, wPacked, _embedIn.Ptr, g, par, bias.Ptr);
         }
         _whh0 = w.Linear(p + "dec_rnn.lstm.weight_hh_l0", g, h);
         _wcat = new PackedMatrix[Math.Max(0, _layers - 1)];

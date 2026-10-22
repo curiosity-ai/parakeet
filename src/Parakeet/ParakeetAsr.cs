@@ -159,5 +159,6 @@ public sealed class ParakeetAsr : IDisposable
     {
         Encoder.Dispose();
         Decoder.Dispose();
+        Parallelism.Dispose();
     }
 }

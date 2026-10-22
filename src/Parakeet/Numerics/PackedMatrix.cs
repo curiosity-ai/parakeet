@@ -1,15 +1,21 @@
 namespace Parakeet.Numerics;
 
 /// <summary>
-/// The right-hand operand <c>B[K, N]</c> of a GEMM, pre-packed into column panels of <see cref="NR"/> = 32 outputs:
-/// element <c>(k, n)</c> lives at <c>[(n / 32) * K + k] * 32 + n % 32</c>, with the last panel zero-padded.
-/// A linear layer with PyTorch weight <c>W[out, in]</c> is <c>B = Wᵀ</c> (K = in, N = out). The panel is the exact
-/// layout the GEMM micro-kernel streams, so weights are reordered once at load time and never again.
+/// The right-hand operand <c>B[K, N]</c> of a GEMM, pre-packed into column panels of <see cref="NR"/> = 32 outputs,
+/// split along K into blocks of <see cref="KBlock"/> rows and stored k-block-major: block <c>kb</c> holds, for every
+/// panel in turn, its <c>kc × 32</c> tile (<c>kc = min(KBlock, K - kb·KBlock)</c>), with the last panel zero-padded.
+/// A thread sweeping consecutive panels of one k-block therefore reads one contiguous stream, which keeps the
+/// hardware and software prefetchers effective when the weights come from DRAM (each weight is used once per pass).
+/// A linear layer with PyTorch weight <c>W[out, in]</c> is <c>B = Wᵀ</c> (K = in, N = out). Weights are reordered
+/// once at load time and never again.
 /// A matrix either owns its buffer or is a view over caller-provided scratch memory (attention packs K/V per head).
 /// </summary>
 public sealed unsafe class PackedMatrix : IDisposable
 {
     public const int NR = 32;
+
+    /// <summary>K rows per block (the GEMM's KC).</summary>
+    public static readonly int KBlock = int.TryParse(Environment.GetEnvironmentVariable("PARAKEET_KC"), out int kc) ? kc : 256;
 
     private readonly NativeBuffer<float>? _owned;
     private readonly float* _data;
@@ -34,6 +40,18 @@ public sealed unsafe class PackedMatrix : IDisposable
     public int N { get; }
     public int Blocks => (N + NR - 1) / NR;
     internal float* Data => _data;
+
+    /// <summary>The <c>kc × 32</c> tile of panel <paramref name="nb"/> for the k-block starting at <paramref name="k0"/>.</summary>
+    internal float* Panel(int nb, int k0) => _data + (long)k0 * Blocks * NR + (long)nb * Math.Min(KBlock, K - k0) * NR;
+
+    /// <summary>Offset of element (k, n) in a packed <c>k × n</c> matrix.</summary>
+    private static long Offset(int kk, int col, int k, int n)
+    {
+        int k0 = kk / KBlock * KBlock;
+        int kc = Math.Min(KBlock, k - k0);
+        int blocks = (n + NR - 1) / NR;
+        return (long)k0 * blocks * NR + ((long)(col / NR) * kc + (kk - k0)) * NR + col % NR;
+    }
     public long ByteSize => (long)Blocks * K * NR * sizeof(float);
 
     /// <summary>Number of floats needed to pack a <c>k × n</c> matrix.</summary>
@@ -62,15 +80,19 @@ public sealed unsafe class PackedMatrix : IDisposable
     public static void PackLinear(float* w, int n, int k, long ldw, float* dst, float scale = 1f)
     {
         int blocks = (n + NR - 1) / NR;
-        for (int nb = 0; nb < blocks; nb++)
+        if (n % NR != 0) new Span<float>(dst, checked((int)SizeOf(k, n))).Clear();
+        for (int k0 = 0; k0 < k; k0 += KBlock)
         {
-            float* d = dst + (long)nb * k * NR;
-            int cols = Math.Min(NR, n - nb * NR);
-            if (cols < NR) new Span<float>(d, k * NR).Clear();
-            for (int j = 0; j < cols; j++)
+            int kc = Math.Min(KBlock, k - k0);
+            for (int nb = 0; nb < blocks; nb++)
             {
-                float* row = w + (long)(nb * NR + j) * ldw;
-                for (int kk = 0; kk < k; kk++) d[(long)kk * NR + j] = row[kk] * scale;
+                float* d = dst + (long)k0 * blocks * NR + (long)nb * kc * NR;
+                int cols = Math.Min(NR, n - nb * NR);
+                for (int j = 0; j < cols; j++)
+                {
+                    float* row = w + (long)(nb * NR + j) * ldw + k0;
+                    for (int kk = 0; kk < kc; kk++) d[kk * NR + j] = row[kk] * scale;
+                }
             }
         }
     }
@@ -79,19 +101,23 @@ public sealed unsafe class PackedMatrix : IDisposable
     public static void PackKN(float* b, int k, int n, long ldb, float* dst, float scale = 1f)
     {
         int blocks = (n + NR - 1) / NR;
-        for (int nb = 0; nb < blocks; nb++)
+        if (n % NR != 0) new Span<float>(dst, checked((int)SizeOf(k, n))).Clear();
+        for (int k0 = 0; k0 < k; k0 += KBlock)
         {
-            float* d = dst + (long)nb * k * NR;
-            int cols = Math.Min(NR, n - nb * NR);
-            if (cols == NR && scale == 1f)
+            int kc = Math.Min(KBlock, k - k0);
+            for (int nb = 0; nb < blocks; nb++)
             {
-                for (int kk = 0; kk < k; kk++)
-                    Buffer.MemoryCopy(b + kk * ldb + nb * NR, d + (long)kk * NR, NR * sizeof(float), NR * sizeof(float));
-                continue;
+                float* d = dst + (long)k0 * blocks * NR + (long)nb * kc * NR;
+                int cols = Math.Min(NR, n - nb * NR);
+                for (int kk = 0; kk < kc; kk++)
+                {
+                    float* src = b + (k0 + kk) * ldb + nb * NR;
+                    if (cols == NR && scale == 1f)
+                        Buffer.MemoryCopy(src, d + kk * NR, NR * sizeof(float), NR * sizeof(float));
+                    else
+                        for (int j = 0; j < cols; j++) d[kk * NR + j] = src[j] * scale;
+                }
             }
-            if (cols < NR) new Span<float>(d, k * NR).Clear();
-            for (int kk = 0; kk < k; kk++)
-                for (int j = 0; j < cols; j++) d[(long)kk * NR + j] = b[kk * ldb + nb * NR + j] * scale;
         }
     }
 
@@ -114,7 +140,7 @@ public sealed unsafe class PackedMatrix : IDisposable
     {
         var r = new float[(long)K * N];
         for (int kk = 0; kk < K; kk++)
-            for (int j = 0; j < N; j++) r[(long)kk * N + j] = _data[((long)(j / NR) * K + kk) * NR + j % NR];
+            for (int j = 0; j < N; j++) r[(long)kk * N + j] = _data[Offset(kk, j, K, N)];
         return r;
     }
 
