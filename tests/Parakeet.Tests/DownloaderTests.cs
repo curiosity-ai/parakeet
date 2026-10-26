@@ -205,7 +205,7 @@ public sealed class DownloaderTests(ITestOutputHelper output) : IDisposable
         Assert.True(ParakeetModels.TryParse("v3", out var v3));
         Assert.Equal(ParakeetModel.TdtV3, v3);
         Assert.False(ParakeetModels.TryParse("whisper", out _));
-        Assert.Equal("https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo",
+        Assert.Equal("https://models.curiosity.ai/parakeet/parakeet-tdt-0.6b-v3.nemo",
                      ParakeetModels.GetDownloadUrl(ParakeetModel.TdtV3));
         Assert.EndsWith("parakeet-tdt-0.6b-v2.nemo", ParakeetModels.GetDefaultCachePath(ParakeetModel.TdtV2));
     }

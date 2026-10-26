@@ -90,7 +90,7 @@ and `--chunk-overlap`.
 `ParakeetAsr.LoadAsync(ParakeetModel model, options, modelUrl, downloadToPath, reportProgress)` downloads the
 checkpoint once and loads it; `ParakeetAsr.DownloadModelAsync(model, downloadToPath, reportProgress)` only downloads.
 Files are cached in `~/.cache/parakeet` (or `$PARAKEET_CACHE`). The catalog in `ParakeetModels` (repository, file
-name, exact size, URL) points at the `.nemo` files on Hugging Face for now; `ParakeetModels.GetDownloadUrl` is the one
+name, exact size, URL) points at the `.nemo` files mirrored at `models.curiosity.ai/parakeet/` (the originals are on Hugging Face); `ParakeetModels.GetDownloadUrl` is the one
 place to switch to another host serving the same files, and `modelUrl` overrides it per call.
 
 The downloader (`IO/ModelDownloader.cs`, same design as the EmbeddingGemma2 one in sentence-transformers-sharp)

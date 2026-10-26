@@ -37,10 +37,11 @@ public static class ParakeetModels
         _ => throw new ArgumentOutOfRangeException(nameof(model)),
     };
 
-    /// <summary>Default download URL: the unmodified <c>.nemo</c> file on Hugging Face. This is the one place to point
-    /// at another host that serves the same bytes (the size check in <see cref="GetFileSize"/> still applies).</summary>
+    /// <summary>Default download URL: the unmodified <c>.nemo</c> file, mirrored at models.curiosity.ai (the original is
+    /// <c>https://huggingface.co/{<see cref="GetRepository"/>}/resolve/main/{<see cref="GetFileName"/>}</c>). This is the one place to
+    /// point at another host that serves the same bytes (the size check in <see cref="GetFileSize"/> still applies).</summary>
     public static string GetDownloadUrl(ParakeetModel model) =>
-        $"https://huggingface.co/{GetRepository(model)}/resolve/main/{GetFileName(model)}";
+        $"https://models.curiosity.ai/parakeet/{GetFileName(model)}";
 
     /// <summary>Directory downloaded checkpoints are cached in: <c>$PARAKEET_CACHE</c>, else <c>~/.cache/parakeet</c>.</summary>
     public static string CacheDirectory =>
