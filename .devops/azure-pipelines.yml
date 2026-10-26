@@ -1,0 +1,86 @@
+# Builds, tests and publishes the ParakeetSharp NuGet package (src/Parakeet, pure C# Parakeet TDT speech recognition)
+# with a CalVer version (yy.M.<buildId>). The package id is ParakeetSharp because "Parakeet" on nuget.org belongs to an
+# unrelated project; the library's namespace is still Parakeet.
+
+variables:
+  solution: './Parakeet.slnx'
+  project: './src/Parakeet/Parakeet.csproj'
+  buildConfiguration: 'Release'
+  targetVersion: yy.M.$(build.buildId)
+  packageOutput: '$(Build.ArtifactStagingDirectory)/packages'
+  # Azure DevOps service connection (NuGet, external feed) used to push the package.
+  nugetServiceConnection: 'nuget-curiosity-org'
+
+pool:
+  vmImage: 'windows-latest'
+
+trigger:
+- master
+
+steps:
+- checkout: self
+  fetchDepth: 10
+
+- task: PowerShell@2
+  displayName: 'Create CalVer version'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $dottedDate = (Get-Date).ToString("yy.M")
+      $modBuildID = [int]$env:BUILD_BUILDID % 65536  # must fit a version component
+      $newTargetVersion = "$dottedDate.$modBuildID"
+      Write-Host "##vso[task.setvariable variable=targetVersion;]$newTargetVersion"
+      Write-Host "Updated targetVersion to '$newTargetVersion'"
+
+- task: UseDotNet@2
+  displayName: 'Use .NET 10.0 SDK'
+  inputs:
+    packageType: sdk
+    version: 10.x
+    includePreviewVersions: false
+    installationPath: $(Agent.ToolsDirectory)/dotnet
+
+- task: DotNetCoreCLI@2
+  displayName: 'restore'
+  inputs:
+    command: 'restore'
+    projects: '$(solution)'
+
+- task: DotNetCoreCLI@2
+  displayName: 'build'
+  inputs:
+    command: 'build'
+    projects: '$(solution)'
+    arguments: '-c $(buildConfiguration) --no-restore /p:Version=$(targetVersion)'
+
+# Kernel and downloader tests. The model tests (parity with ONNX Runtime, end to end) skip themselves without
+# PARAKEET_MODEL / PARAKEET_REFERENCE_DIR, since they need the 2.5 GB checkpoint and reference dumps.
+- task: DotNetCoreCLI@2
+  displayName: 'test'
+  inputs:
+    command: 'test'
+    projects: 'tests/Parakeet.Tests/Parakeet.Tests.csproj'
+    arguments: '-c $(buildConfiguration) --no-build'
+
+- task: DotNetCoreCLI@2
+  displayName: 'pack ParakeetSharp'
+  inputs:
+    command: 'custom'
+    custom: 'pack'
+    projects: '$(project)'
+    arguments: '-c $(buildConfiguration) --no-build /p:Version=$(targetVersion) -o $(packageOutput)'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'publish package as build artifact'
+  inputs:
+    PathtoPublish: '$(packageOutput)'
+    ArtifactName: 'packages'
+
+- task: NuGetCommand@2
+  displayName: 'push nuget package'
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+  inputs:
+    command: 'push'
+    packagesToPush: '$(packageOutput)/*.nupkg'
+    nuGetFeedType: 'external'
+    publishFeedCredentials: '$(nugetServiceConnection)'

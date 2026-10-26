@@ -19,7 +19,7 @@ public static class ModelDownloader
     private static HttpClient CreateClient()
     {
         var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("Parakeet.NET/1.0");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("ParakeetSharp/1.0");
         return client;
     }
 
