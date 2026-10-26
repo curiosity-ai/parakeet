@@ -58,7 +58,28 @@ float[] samples = /* 16 kHz mono */;
 var r = asr.Transcribe(samples, onText: delta => Console.Write(delta));   // streams text as tokens are decoded
 ```
 
-`ParakeetOptions` sets `Threads`, `Precision` (`Float32` / `Int8`), `PadMode`, `PositionCacheFrames` and `HugePages`.
+`ParakeetOptions` sets `Threads`, `Precision` (`Float32` / `Int8`), `PadMode`, `PositionCacheFrames`, `HugePages`,
+`ChunkSeconds` and `ChunkOverlapSeconds`.
+
+### Long audio
+
+Input longer than `ChunkSeconds` (default 300 s) is transcribed in overlapping windows (`ChunkOverlapSeconds`, default
+15 s), so any length takes bounded time and memory per encoder pass. Shorter input is encoded in one pass exactly as
+before; `ChunkSeconds = 0` turns chunking off. This is the long-audio mode of the original Go server
+(`.reference/internal/asr/{chunker,boundary,seam}.go`), minus the Silero VAD layer:
+
+- The mel features are computed once for the whole input, so the per-feature normalization stays global.
+- Each window is encoded and decoded on its own but keeps only the tokens in its own part of the overlap. Window starts
+  are multiples of the subsampling factor, so token frames map back to absolute time without rounding.
+- The split inside each overlap is the quietest point of the smoothed mel energy (~150 ms), falling back to the
+  midpoint; a cut inside a word makes both windows time it differently and emit it twice or not at all.
+- The first three kept tokens of every window after the first are compared with the tail of the previous one and dropped
+  if within 3 encoder frames (~240 ms): a duplicate, or a collision that the earlier, warmed-up window wins.
+- `onText` keeps streaming in order across seams; only those three tokens per seam wait for the comparison.
+
+The Go server's Silero VAD needs ONNX Runtime, which this library does not use, so the VAD layer is not ported. Chunking
+is offline: a window needs all of its audio, so this is not live streaming of audio. The CLI takes `--chunk-seconds`
+and `--chunk-overlap`.
 
 ### Model download
 

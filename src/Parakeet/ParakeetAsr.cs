@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Parakeet.Audio;
+using Parakeet.Chunking;
 using Parakeet.IO;
 using Parakeet.Model;
 using Parakeet.Numerics;
@@ -29,6 +30,16 @@ public sealed record ParakeetOptions
     /// <summary>Precision of the encoder's large projections. <see cref="WeightPrecision.Int8"/> (opt-in) quantizes them
     /// for AVX-VNNI: roughly twice the GEMM throughput and a quarter of the weight memory, with a small accuracy cost.</summary>
     public WeightPrecision Precision { get; init; } = WeightPrecision.Float32;
+
+    /// <summary>Longest stretch of audio (seconds) the encoder runs over in one pass. Longer input is split into
+    /// overlapping windows of this size whose seams are placed on the quietest point of the overlap and de-duplicated, so
+    /// any length can be transcribed in bounded time and memory per window. Input that fits one window takes the
+    /// unchunked path and is unaffected. 0 turns chunking off (the whole input is encoded in one pass).</summary>
+    public double ChunkSeconds { get; init; } = 300;
+
+    /// <summary>Audio (seconds) shared by neighbouring windows. It gives the encoder context on both sides of a seam and
+    /// the decoder time to warm up before the window's own region starts. Must be smaller than <see cref="ChunkSeconds"/>.</summary>
+    public double ChunkOverlapSeconds { get; init; } = 15;
 }
 
 /// <summary>A decoded token with its time span.</summary>
@@ -59,6 +70,9 @@ public sealed class ParakeetAsr : IDisposable
     private ParakeetAsr(ITensorSource source, ParakeetConfig config, Vocabulary vocabulary, ParakeetOptions options)
     {
         Config = config with { Mel = config.Mel with { PadMode = options.PadMode } };
+        Options = options;
+        if (options.ChunkSeconds > 0)
+            ChunkPlanner.Validate(SecondsToMelFrames(options.ChunkSeconds), SecondsToMelFrames(options.ChunkOverlapSeconds), Config.SubsamplingFactor);
         Vocabulary = vocabulary;
         Parallelism = new Parallelism(options.Threads);
         var w = new WeightReader(source, options.HugePages, options.Precision);
@@ -80,6 +94,7 @@ public sealed class ParakeetAsr : IDisposable
     }
 
     public ParakeetConfig Config { get; }
+    public ParakeetOptions Options { get; }
     public Vocabulary Vocabulary { get; }
 
     /// <summary>Effective precision of the encoder projections (Int8 falls back to Float32 without AVX-VNNI).</summary>
@@ -169,7 +184,11 @@ public sealed class ParakeetAsr : IDisposable
     /// <summary>Transcribes a WAV file (any sample rate / channel count).</summary>
     public Transcription TranscribeFile(string path, CancellationToken ct = default) => Transcribe(WaveFile.ReadMono(path, SampleRate), ct);
 
-    /// <summary>Transcribes 16 kHz mono audio. <paramref name="onText"/> receives text deltas as tokens are decoded.</summary>
+    /// <summary>
+    /// Transcribes 16 kHz mono audio of any length. <paramref name="onText"/> receives text deltas as tokens are decoded
+    /// (in order, also across chunk seams). Audio longer than <see cref="ParakeetOptions.ChunkSeconds"/> is transcribed
+    /// in overlapping windows; shorter audio is encoded in one pass.
+    /// </summary>
     public Transcription Transcribe(ReadOnlySpan<float> audio, CancellationToken ct = default, Action<string>? onText = null)
     {
         double seconds = audio.Length / (double)SampleRate;
@@ -181,6 +200,10 @@ public sealed class ParakeetAsr : IDisposable
         var tFeat = sw.Elapsed;
         ct.ThrowIfCancellationRequested();
 
+        int chunkFrames = Options.ChunkSeconds > 0 ? SecondsToMelFrames(Options.ChunkSeconds) : int.MaxValue;
+        if (melFrames > chunkFrames)
+            return TranscribeChunked(features, melFrames, seconds, tFeat, ct, onText);
+
         sw.Restart();
         float[] enc = Encoder.Forward(features, melFrames, Parallelism);
         int frames = Config.EncoderFrames(melFrames);
@@ -188,14 +211,78 @@ public sealed class ParakeetAsr : IDisposable
         ct.ThrowIfCancellationRequested();
 
         sw.Restart();
-        Action<DecodedToken>? stream = onText == null ? null : tok =>
-        {
-            string s = Vocabulary.PieceText(tok.Id);
-            if (s.Length > 0) onText(s);
-        };
+        Action<DecodedToken>? stream = onText == null ? null : tok => EmitText(tok, onText);
         var decoded = Decoder.Decode(enc, frames, Parallelism, ct, stream);
         var tDec = sw.Elapsed;
         return BuildResult(decoded, seconds, tFeat, tEnc, tDec);
+    }
+
+    private int SecondsToMelFrames(double seconds) => (int)Math.Round(seconds * Config.Mel.SampleRate / Config.Mel.HopLength);
+
+    private void EmitText(DecodedToken tok, Action<string> onText)
+    {
+        string s = Vocabulary.PieceText(tok.Id);
+        if (s.Length > 0) onText(s);
+    }
+
+    /// <summary>
+    /// Long audio: features are computed once for the whole input (the per-feature normalization stays global), then each
+    /// window is encoded and decoded on its own. A window decodes everything it covers, so its decoder state stays
+    /// coherent, but keeps only the tokens in its own region of the overlap. The first few kept tokens of every window
+    /// after the first wait for <see cref="SeamDeduper"/>; everything else streams as it is decoded.
+    /// </summary>
+    private Transcription TranscribeChunked(float[] features, int melFrames, double seconds, TimeSpan tFeat, CancellationToken ct, Action<string>? onText)
+    {
+        int bins = Config.Mel.Features, sub = Config.SubsamplingFactor;
+        var oracle = new ChainBoundaryOracle(new MelEnergyBoundaryOracle(features, melFrames, bins), new MidpointBoundaryOracle());
+        var plan = ChunkPlanner.Plan(melFrames, SecondsToMelFrames(Options.ChunkSeconds), SecondsToMelFrames(Options.ChunkOverlapSeconds), sub, oracle);
+
+        var all = new List<DecodedToken>();
+        TimeSpan tEnc = TimeSpan.Zero, tDec = TimeSpan.Zero;
+        for (int i = 0; i < plan.Count; i++)
+        {
+            var win = plan[i];
+            int windowMel = win.End - win.Start;
+            // Window starts are multiples of the subsampling factor, so these are exact.
+            int frameOffset = win.Start / sub;
+            int emitStart = (win.EmitStart - win.Start) / sub;
+            int emitEnd = i == plan.Count - 1 ? int.MaxValue : (win.EmitEnd - win.Start) / sub;
+
+            var sw = Stopwatch.StartNew();
+            float[] enc = Encoder.Forward(features.AsSpan((int)((long)win.Start * bins), windowMel * bins), windowMel, Parallelism);
+            int frames = Config.EncoderFrames(windowMel);
+            tEnc += sw.Elapsed;
+            ct.ThrowIfCancellationRequested();
+
+            sw.Restart();
+            var previous = all.Count > 0 ? all.GetRange(Math.Max(0, all.Count - SeamDeduper.HeadTokens), Math.Min(all.Count, SeamDeduper.HeadTokens)) : [];
+            var head = new List<DecodedToken>();
+            bool resolved = i == 0;
+
+            void Keep(DecodedToken tok)
+            {
+                all.Add(tok);
+                if (onText != null) EmitText(tok, onText);
+            }
+            void FlushHead()
+            {
+                foreach (var tok in SeamDeduper.Resolve(previous, head)) Keep(tok);
+                head.Clear();
+                resolved = true;
+            }
+
+            Decoder.Decode(enc, frames, Parallelism, ct, tok =>
+            {
+                if (tok.Frame < emitStart || tok.Frame >= emitEnd) return;
+                var absolute = tok with { Frame = tok.Frame + frameOffset };
+                if (resolved) { Keep(absolute); return; }
+                head.Add(absolute);
+                if (head.Count >= SeamDeduper.HeadTokens) FlushHead();
+            });
+            if (!resolved) FlushHead();
+            tDec += sw.Elapsed;
+        }
+        return BuildResult(all, seconds, tFeat, tEnc, tDec);
     }
 
     private Transcription BuildResult(List<DecodedToken> decoded, double seconds, TimeSpan tFeat, TimeSpan tEnc, TimeSpan tDec)

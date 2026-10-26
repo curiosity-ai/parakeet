@@ -21,6 +21,9 @@ if (args.Length == 0 || args[0] is "-h" or "--help")
                                 extracted NeMo directory or ONNX export directory
           --threads <n>         worker threads (default: all cores)
           --runs <n>            bench: timed runs per file (default 3, after one warm-up)
+          --chunk-seconds <s>   longest audio encoded in one pass; longer input is split into overlapping windows
+                                (default 300, 0 = never split)
+          --chunk-overlap <s>   overlap between windows (default 15)
           --zero-pad            NeMo-style zero padding for the STFT (default: reflect, like the ONNX export)
           --int8                int8 encoder projections on AVX-VNNI (faster, approximate)
           --json                transcribe: print JSON with token and word timestamps
@@ -34,6 +37,7 @@ var files = new List<string>();
 string model = "v2";
 string? outPath = null;
 int threads = 0, runs = 3;
+double chunkSeconds = 300, chunkOverlap = 15;
 bool json = false, words = false, zeroPad = false, int8 = false;
 for (int i = 1; i < args.Length; i++)
 {
@@ -42,6 +46,8 @@ for (int i = 1; i < args.Length; i++)
         case "--model": model = args[++i]; break;
         case "--out": outPath = args[++i]; break;
         case "--threads": threads = int.Parse(args[++i]); break;
+        case "--chunk-seconds": chunkSeconds = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
+        case "--chunk-overlap": chunkOverlap = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); break;
         case "--runs": runs = int.Parse(args[++i]); break;
         case "--json": json = true; break;
         case "--words": words = true; break;
@@ -82,6 +88,8 @@ try
     asr = await ParakeetAsr.LoadAsync(model, new ParakeetOptions
     {
         Threads = threads,
+        ChunkSeconds = chunkSeconds,
+        ChunkOverlapSeconds = chunkOverlap,
         PadMode = zeroPad ? StftPadMode.Constant : StftPadMode.Reflect,
         Precision = int8 ? Parakeet.Numerics.WeightPrecision.Int8 : Parakeet.Numerics.WeightPrecision.Float32,
     }, progress);
