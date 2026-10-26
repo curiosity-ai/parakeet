@@ -44,6 +44,10 @@ dotnet run -c Release --project src/Parakeet.Cli -- download --model v3 [--out /
 
 ### Library
 
+```bash
+dotnet add package ParakeetSharp      # namespace: Parakeet
+```
+
 ```csharp
 using Parakeet;
 
@@ -267,6 +271,11 @@ dotnet build Parakeet.slnx -c Release
 
 Requires the .NET 10 SDK. AVX-512 (or AVX2 + FMA) is used when available, with portable fallbacks; the int8 mode
 needs AVX-VNNI.
+
+`.devops/azure-pipelines.yml` is the Azure DevOps pipeline: on every push to `master` it restores, builds and tests the
+solution, packs `src/Parakeet` as the `ParakeetSharp` NuGet package with a CalVer version `yy.M.<buildId>`, publishes it
+as a build artifact and pushes it to NuGet through the `nuget-curiosity-org` service connection. (The id `Parakeet` on
+nuget.org belongs to an unrelated project.)
 
 ## License
 

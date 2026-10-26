@@ -24,7 +24,22 @@ public sealed class DownloaderTests(ITestOutputHelper output) : IDisposable
         private readonly byte[] _data;
         private int _drops;
 
-        public TestServer(byte[] data, int drops = 0, long dropAfter = 0)
+        /// <summary>Starts a server, or returns null (and says why) when the platform refuses the listener, e.g. Windows
+        /// without an http.sys URL reservation for a non-admin user.</summary>
+        public static TestServer? TryStart(ITestOutputHelper output, byte[] data, int drops = 0, long dropAfter = 0)
+        {
+            try
+            {
+                return new TestServer(data, drops, dropAfter);
+            }
+            catch (HttpListenerException e)
+            {
+                output.WriteLine($"SKIPPED: cannot start a local HTTP listener ({e.Message}).");
+                return null;
+            }
+        }
+
+        private TestServer(byte[] data, int drops = 0, long dropAfter = 0)
         {
             _data = data;
             _drops = drops;
@@ -107,7 +122,8 @@ public sealed class DownloaderTests(ITestOutputHelper output) : IDisposable
     public async Task DownloadsAndReportsProgress()
     {
         var data = Payload(3 << 20);
-        using var server = new TestServer(data);
+        using var server = TestServer.TryStart(output, data);
+        if (server == null) return;
         string path = Path.Combine(_dir, "sub", "model.bin");
         var reports = new List<DownloadProgress>();
         await ModelDownloader.DownloadFileAsync(server.Url + "model.bin", path, reports.Add, data.Length);
@@ -126,7 +142,8 @@ public sealed class DownloaderTests(ITestOutputHelper output) : IDisposable
     public async Task ResumesAfterAConnectionDrop()
     {
         var data = Payload(2 << 20);
-        using var server = new TestServer(data, drops: 1, dropAfter: 700_000);
+        using var server = TestServer.TryStart(output, data, drops: 1, dropAfter: 700_000);
+        if (server == null) return;
         string path = Path.Combine(_dir, "model.bin");
         await ModelDownloader.DownloadFileAsync(server.Url + "model.bin", path, null, data.Length);
         Assert.Equal(data, File.ReadAllBytes(path));
@@ -139,7 +156,8 @@ public sealed class DownloaderTests(ITestOutputHelper output) : IDisposable
     public async Task ResumesAPartialFileFromAnEarlierProcess()
     {
         var data = Payload(1 << 20);
-        using var server = new TestServer(data);
+        using var server = TestServer.TryStart(output, data);
+        if (server == null) return;
         string path = Path.Combine(_dir, "model.bin");
         Directory.CreateDirectory(_dir);
         File.WriteAllBytes(path + ".download", data[..300_000]);
@@ -152,7 +170,8 @@ public sealed class DownloaderTests(ITestOutputHelper output) : IDisposable
     public async Task ReplacesACachedFileOfTheWrongSize()
     {
         var data = Payload(100_000);
-        using var server = new TestServer(data);
+        using var server = TestServer.TryStart(output, data);
+        if (server == null) return;
         string path = Path.Combine(_dir, "model.bin");
         Directory.CreateDirectory(_dir);
         File.WriteAllBytes(path, new byte[10]);
@@ -164,7 +183,8 @@ public sealed class DownloaderTests(ITestOutputHelper output) : IDisposable
     public async Task RejectsAnUnexpectedSizeAndMissingFiles()
     {
         var data = Payload(100_000);
-        using var server = new TestServer(data);
+        using var server = TestServer.TryStart(output, data);
+        if (server == null) return;
         string path = Path.Combine(_dir, "model.bin");
         await Assert.ThrowsAsync<InvalidDataException>(() => ModelDownloader.DownloadFileAsync(server.Url + "model.bin", path, null, data.Length + 1));
         Assert.False(File.Exists(path));

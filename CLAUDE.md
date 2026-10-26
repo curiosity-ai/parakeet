@@ -4,13 +4,14 @@ Guidance for Claude Code (and other contributors) working in this repository.
 
 ## Layout
 
-- `src/Parakeet/` — the library (NuGet package `Parakeet`): audio front end, FastConformer encoder, TDT decoder,
+- `src/Parakeet/` — the library (NuGet package `ParakeetSharp`): audio front end, FastConformer encoder, TDT decoder,
   checkpoint readers (`.nemo`, ONNX export), SIMD numerics.
 - `src/Parakeet.Cli/` — the `parakeet` command-line tool (`transcribe`, `bench`).
 - `tests/Parakeet.Tests/` — xUnit: kernel tests (always run) and model tests (need the environment below).
 - `benchmarks/Parakeet.Benchmarks/` — in-process comparison with ONNX Runtime, GEMM micro-benchmarks.
 - `tools/Parakeet.TestAudio/` — regenerates `testdata/audio` with the Voxwerk NuGet packages.
 - `scripts/onnx_reference.py` — ONNX Runtime reference dumps for the parity tests.
+- `.devops/azure-pipelines.yml` — Azure DevOps CI: build, test, pack `ParakeetSharp` (CalVer `yy.M.<buildId>`), push on `master`.
 - `.reference/` — the original Go/ONNX Runtime server, kept read-only as the reference implementation. Its GitHub
   workflows are disabled (`.github/workflows/*.disabled`); do not re-enable them.
 
